@@ -41,13 +41,13 @@ Reverse-engineering the Torso T-1 sequencer's backup format to import/export pat
   (incl. final-block exception), groove `entry_count` packing, bank summary/cursor, and the
   stored-state-region findings are all there.
 
-## 📖 Device manual — investigate to map features → bytes
-**https://docs.torsoelectronics.com/t1/introduction** — the official T-1 manual. We must mine it
-for the full **per-track parameter list** (Pitch, Style/Voicing, Harmony, Repeats, Cycles,
-Rotate, Random, Phrase, Melody, Accent, Time, Chance, etc.) and how each behaves, then map each
-parameter to bytes in the stored-state region via sweeps. **Leading hypothesis:** the chord-
-rendering field is the track's **Style/Voicing** (how a step's multiple pitches are distributed —
-"Chord" plays them together; arpeggio styles don't). Confirm against the manual + a Style sweep.
+## 📖 Device manual — for mapping any remaining features → bytes
+**https://docs.torsoelectronics.com/t1/introduction** — the official T-1 manual (JS SPA; deep
+pages like `…/t1/parameter-reference/shape/voicing-style` are reachable directly). Mine it for
+the per-track parameter list (Pitch, Style/Voicing, Harmony, Repeats, Cycles, Rotate, Random,
+Phrase, Accent, Time, Chance, …) to name the still-undecoded steps-region params. NOTE: **Style
+(`steps+0x13d`, poly 0-4 / mono 8-12) is decoded and was NOT the chord blocker** — the blocker
+was the trailing lock-summary + load rules (resolved; see FORMAT.md).
 
 ## Tools (Python 3, no dependencies)
 - `t1_format.py` — parser. `parse_bank(path)` → `{patterns: [[track,…],…], tracks:[…]}`.
@@ -106,13 +106,16 @@ settings, so always splice into a real backup — never ship a zip with only you
 
 ## `hwtest/` — hardware-verification working set
 - `p1_routing.mid` / `p2_dynamics.mid` — test patterns (routing+pitch+chords / velocity+sustain).
-- `hwtest.t1`, `project.zip` — current importer output + its spliced backup zip.
-- `hwtest_handtmpl.t1`, `project_diag.zip` — **diagnostic** bank: same fields but stored-state
-  cloned per-track from real device blocks. **Loaded & rendered perfectly on device** → proved
-  the stored-state region is the chord blocker.
+- `hwtest_locksummary.t1`, `project_locksummary.zip` — **current importer output + spliced backup;
+  HARDWARE-VERIFIED** (chords + all load-rules render correctly from a synthesized template).
+- `hwtest.t1`, `project.zip` — earlier importer output (before the lock-summary fix); its bank
+  loaded but mis-rendered chords + dropped a pattern.
+- `hwtest_handtmpl.t1`, `project_diag.zip` — diagnostic bank with stored-state cloned per-track
+  from real device blocks; loaded & rendered correctly (the proven clone-from-device fallback).
 - `fromT1/` — **device-authored reference files** (ground truth): `handmade.zip` (our target,
   programmed by hand on the T-1 = `samples/11`), `handmade2.zip` (pc=3 chord-default variant),
-  `project.zip` (device's re-export of our broken bank).
+  `project.zip` (device's re-export of our broken bank), `original_backup.zip` (a full 8-bank
+  real backup — the splice base for building loadable test zips).
 
 ## Format essentials (full detail in FORMAT.md)
 - A `.t1` = one **bank**. Layout: `05 "2.1.4"` header, a `track-count` byte, packed
@@ -152,28 +155,14 @@ Each folder is one experiment that decoded part of the format; `.t1` files are e
 LED readings, and what each one decoded, with tables).
 
 ## Next steps (start here in a new conversation)
-**Priority 1 — decode the per-track stored-state region (the chord blocker + all missing
-features).** It's 695 bytes; only 9 offsets known; ~498 vary. The blocker is that per-track
-"random" noise swamps any field diff. Plan, **in order**:
-   a. **★ Isolate the random buffer FIRST (user's key idea).** The T-1 has a per-track **random
-      function** (find it in the manual — likely "Random" + a regenerate/re-seed action). Take a
-      bank, export, then **regenerate ONLY the random sequence** (no parameter changes) and export
-      again. By determinism, the **bytes that change = the genuine random buffer**; the bytes that
-      stay = structured parameters. This **carves `steps_region` into `[random | params]`**, so
-      every later sweep can ignore the random bytes and read fields cleanly. Do a few regenerate
-      cycles to map the full random extent. (This also tells us what the importer may freely
-      clone vs must set.)
-   b. **Read the manual** (link above) → enumerate every per-track parameter and what it does.
-   c. **Confirm the chord field**: ask the user what the chord track's **Style/Voicing** was vs a
-      normal track; request a **Style sweep** backup (one track, Style = 0,1,2,… across
-      consecutive patterns/tracks) → the byte counting `0,1,2,…` in the *param* region is the
-      Style field. Patch it so chords render from *any* template.
-   d. Sweep the other parameters the same way (Repeats, Cycles, Rotate, Phrase, Harmony, etc.) to
-      map the param region and expose each as an importer feature.
-   - **Interim option** (if a working chord-import is wanted before full RE): make the importer
-     clone stored-state **per-track from a real device reference** (e.g. pick the matching block
-     of `samples/11_multipattern_locklast/handmade.t1` by lock-type), as `hwtest_handtmpl.t1`
-     does. Quick win; proven on device.
+**✓ DONE this session — chord import (the old Priority 1 blocker).** The per-track steps-region
+is carved into `[random buffer | params | trailing lock-summary]`; chords + all lock load-rules
+are decoded and the importer is hardware-verified. Method/tooling that worked: `t1_blockdiff.py`
+(random re-roll to isolate the buffer, then sweeps); experiments in `samples/12–14`; full decode
+in FORMAT.md. The remaining steps-region work is now optional polish, not a blocker:
+   - Name the other ~8 Zone-A random sequences (re-roll each parameter; see FORMAT.md Zone A).
+   - Sweep remaining params (Repeats, Cycles, Rotate, Phrase, Harmony, Chance…) to expose them as
+     importer features, using the manual + monotonic sweeps.
 
 **Priority 2 — importer polish**: velocity/sustain on the N×8 grid + sustain default 64 (see
 above); fold the **backup-zip builder** into `midi_to_t1.py` (`--zip`/`--slot`); scale/root

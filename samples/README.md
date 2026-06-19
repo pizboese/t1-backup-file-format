@@ -149,6 +149,21 @@ synthesized import of this shape was rejected by the device (reinitialised to an
 because it wrote the plain `00` terminator. `test_roundtrip.py` now rebuilds this file
 byte-for-byte, locking in the fix.
 
+## 12_random_reroll/ — isolate the per-track random buffer
+One track copied across 4 patterns, re-rolling ONE parameter's random sequence per copy. Carved
+the steps-region into Zone A (`<value><17-B random seq>` records) vs structured bytes. Tool:
+`../t1_blockdiff.py`. See `12_random_reroll/README.md`.
+
+## 13_style_sweep/ — decode Style (voicing)
+One chord track across 10 patterns, Style = VB1..VB5 (poly) then VB9..VB13 (mono). The single
+byte that changed = **Style @ `steps+0x13d`** (poly 0-4 / mono 8-12). Turned out NOT to be the
+chord blocker. See `13_style_sweep/README.md`.
+
+## 14_lock_summary/ — the real chord blocker
+Two patterns of chord-lock tracks that exposed the trailing per-block **lock-summary** at
+`steps+0x29c` and the load rules deciding whether a lock track loads. This decode made
+from-scratch chord import work on hardware. See `14_lock_summary/README.md`.
+
 ## device_settings/
 `Settings.json` and `Wifi.json` as found in a backup — global device configuration
 (MIDI routing, clock, CV, etc.), not part of the per-bank pattern data.

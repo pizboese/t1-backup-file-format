@@ -108,18 +108,16 @@ it** (shown as an empty pattern with one default pulse). A hand-built reference 
 shape (`samples/11_multipattern_locklast/`) revealed it; `midi_to_t1.build_bank` now patches
 this via `final_has_locks`, and `test_roundtrip` rebuilds that reference byte-for-byte.
 
-**⚠️ Per-track "stored-state" region governs chord rendering (CONFIRMED on device):** the
-**695-byte (`0x2b7`) steps-region** (`steps`..block end) is **not inert random data**. We
-previously cloned it wholesale from a *synthesized* template and patched only 9 offsets
-(`steps`=0, `division`=0x2a/0x2b, `scale`=0x40, `velocity`=0x7b, `sustain`=0xa5,
-`midi_mask`=0xe4/0xe5, `root`=0x13f). On hardware, a bank built that way **loaded but
-mis-rendered multi-note pitch locks (chords) and dropped a later pattern**; rebuilding the
-*identical* lock lists with a **real device chord-track's** steps-region (cloned per track from
-`samples/11_multipattern_locklast/`) rendered correctly. So a structured field **somewhere in
-the undecoded ~498 varying bytes** of this region controls chord/voicing behaviour. Across all
-166 sample blocks, 188/695 bytes (27%) are constant; the rest vary (per-track state + still-
-undecoded parameters). **Decoding this region is the main open RE task** (monotonic sweeps).
-Single-note pitch locks and groove locks render fine regardless of this region.
+**Per-track "stored-state" / steps-region — DECODED (chord blocker RESOLVED, hardware-verified).**
+The **695-byte (`0x2b7`) steps-region** (`steps`..block end) is **not inert random data**. It is
+now understood as `[Zone A: param table | params | trailing lock-summary]`, and a from-scratch
+synthesized bank with chords loads & renders on device. The detailed decode + the three
+hardware-confirmed lock load-rules are in the sections below ("Steps-region carved into TWO
+zones", "TRUE chord blocker", "Final lock block"). Historical note: an earlier bank built by
+cloning a *synthesized* (non-lock) template and patching only 9 field offsets **loaded but
+mis-rendered chords + dropped a later pattern** — that was the trailing lock-summary being absent,
+not a voicing field. Single-note pitch locks and groove locks render fine regardless of the
+random bytes; the remaining undecoded bytes are non-critical params (Repeats/Cycles/Rotate/…).
 
 **Region layout (CONFIRMED):** after the 16-byte gate, at `run+0x4c`:
 `[groove list][pitch list][18 B pad][steps]`. The lists are variable-length, so **steps and
