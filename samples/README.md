@@ -140,6 +140,15 @@ successfully** on the T-1 → no checksum; synthesis works. Programmed values:
 All verified on device. (Note: A2 in Iwato/root-C showed snapped to a scale tone → playback
 quantizes pitch to scale+root.)
 
+## 11_multipattern_locklast/ — device-authored, multi-pattern + lock-bearing last block
+`handmade.t1` was **programmed on the device by hand** to mirror our importer test (2 patterns:
+P1 routing/pitch-locks/chords on ch 1-3; P2 velocity ramp + sustain on ch 1-2), then backed up.
+It is the **ground-truth reference** that exposed the **final-block lock-terminator** rule
+(byte = `last_tc-1`, plus a `00` pad on multi-pattern banks — see FORMAT.md). Our first
+synthesized import of this shape was rejected by the device (reinitialised to an empty pattern)
+because it wrote the plain `00` terminator. `test_roundtrip.py` now rebuilds this file
+byte-for-byte, locking in the fix.
+
 ## device_settings/
 `Settings.json` and `Wifi.json` as found in a backup — global device configuration
 (MIDI routing, clock, CV, etc.), not part of the per-bank pattern data.

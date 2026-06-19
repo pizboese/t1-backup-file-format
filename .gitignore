@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Windows "downloaded from" metadata streams
+*Zone.Identifier

@@ -63,9 +63,12 @@ def _parse_locks(data, run):
     groove_count = data[p]; p += 1
     groove = {}                                   # step(0-based) -> {param: value}
     for _ in range(groove_count):
-        entry_count, step, param, val = data[p], data[p + 1], data[p + 2], data[p + 3]
-        groove.setdefault(step, {})[GROOVE_PARAMS.get(param, param)] = val
-        p += 7                                     # [cnt step param val] + 3 pad
+        entry_count, step = data[p], data[p + 1]
+        p += 2
+        for _ in range(entry_count):              # one [param value 00 00 00] per locked param
+            param, val = data[p], data[p + 1]
+            groove.setdefault(step, {})[GROOVE_PARAMS.get(param, param)] = val
+            p += 5
     pitch_count = data[p]; p += 1
     pitch = {}                                     # step(0-based) -> [pitches]
     for _ in range(pitch_count):
@@ -82,6 +85,8 @@ def parse_track(data, run):
     pitches = list(data[bstart + 6:bstart + 6 + pc])
     gate = list(data[run + OFF_GATE:run + OFF_GATE + 16])
     groove_locks, pitch_locks, so = _parse_locks(data, run)
+    # a block carrying any lock has a single 0x00 terminator byte after the steps region
+    lock_term = 1 if (groove_locks or pitch_locks) else 0
     mask = data[so + S_MIDIMASK] | (data[so + S_MIDIMASK + 1] << 8)
     channels = [c + 1 for c in range(16) if mask & (1 << c)]
     div_ticks = data[so + S_DIVISION] | (data[so + S_DIVISION + 1] << 8)
@@ -89,7 +94,7 @@ def parse_track(data, run):
     return {
         "block_start": bstart,
         "run": run,
-        "block_end": so + TAIL_AFTER_STEPS,
+        "block_end": so + TAIL_AFTER_STEPS + lock_term,
         "pitch_count": pc,
         "pitches": pitches,                       # absolute, C3=60
         "gate": gate,                             # 16 x 0/1

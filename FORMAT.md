@@ -1,8 +1,10 @@
 # Torso T-1 `.t1` backup format — reverse-engineering notes
 
-Status: **in progress**. Firmware `2.1.4`. One `.t1` file = one **bank**.
+Status: **export + import working**. Firmware `2.1.4`. One `.t1` file = one **bank**.
 Format is a flat, **deterministic** byte serialization (re-exporting unchanged content
-yields byte-identical files — verified across all 8 banks).
+yields byte-identical files). The full container (track blocks + pattern wrappers + bank
+trailer) is reproduced **byte-for-byte across all 32 sample banks** by `test_roundtrip.py`,
+which is what makes synthesis (MIDI → `.t1`) reliable.
 
 Legend: offsets are 0-based hex. `u8` = one byte. "confirmed" = proven by a controlled
 backup sweep; "hypothesis" = inferred, not yet isolated.
@@ -80,12 +82,44 @@ the per-step random region (file grows ~5–7 B per lock). Locks are stored newe
 e.g. step-1 → 72: `01 | 00 01000000 48`; +step-2 → 62: `02 | 01 01000000 3e | 00 01000000 48`.
 Pitch values absolute (C3=60); polyphonic per step supported.
 
-**Groove locks (CONFIRMED, iteration 8):**
+**Groove locks (CONFIRMED, iteration 8 + import RE):**
 ```
-[num_groove_locks:u8]  then per lock (7 B):  [entry_count:u8][step:u8 0-based][param:u8][value:u8][00 00 00]
+[num_groove_locks:u8]  then per lock:  [entry_count:u8][step:u8 0-based]
+                                       then entry_count × [param:u8][value:u8][00 00 00]
 ```
-param `0x0a`=velocity, `0x0e`=sustain; value 0–127. Verified: step5 vel=40, step6 vel=88,
-step8 sus=16, step9 sus=120 (all matched device LEDs).
+param `0x0a`=velocity, `0x0e`=sustain; value 0–127. One lock record per step; **all groove
+params for that step share the record** (entry_count = how many). A single-param record is
+7 B; a step with both velocity+sustain is 12 B (entry_count=2, two 5-B param entries,
+newest param first). Verified: step5 vel=40, step6 vel=88, step8 sus=16, step9 sus=120
+(matched device LEDs), and `07_perstep_cumulative/d,e` (step-1 sustain+velocity combined).
+
+**Lock terminator (CONFIRMED, import RE):** a track block that carries **any** lock (groove
+or pitch) has **one extra `00` byte appended after the steps region** (block grows by 1,
+once, regardless of lock count). Lock-free blocks have no terminator.
+
+**Final-block exception (CONFIRMED on device):** the **bank's very last block**, when it
+carries locks, uses a *different* terminator: the byte is **`last_tc - 1`** (the last
+pattern's track-count − 1, i.e. the same value as that pattern's end-trailer), **not** `00`;
+and **multi-pattern banks append one extra `00`** after it (so the terminator is 2 bytes
+`<last_tc-1> 00`). Single-pattern banks (`08`/`09`: `last_tc-1 = 0`) reduce to the plain
+single `00`, which is why this went unnoticed until a synthesized **multi-pattern bank with a
+lock-bearing last block** was loaded — the device **rejected the whole bank and reinitialised
+it** (shown as an empty pattern with one default pulse). A hand-built reference of the same
+shape (`samples/11_multipattern_locklast/`) revealed it; `midi_to_t1.build_bank` now patches
+this via `final_has_locks`, and `test_roundtrip` rebuilds that reference byte-for-byte.
+
+**⚠️ Per-track "stored-state" region governs chord rendering (CONFIRMED on device):** the
+**695-byte (`0x2b7`) steps-region** (`steps`..block end) is **not inert random data**. We
+previously cloned it wholesale from a *synthesized* template and patched only 9 offsets
+(`steps`=0, `division`=0x2a/0x2b, `scale`=0x40, `velocity`=0x7b, `sustain`=0xa5,
+`midi_mask`=0xe4/0xe5, `root`=0x13f). On hardware, a bank built that way **loaded but
+mis-rendered multi-note pitch locks (chords) and dropped a later pattern**; rebuilding the
+*identical* lock lists with a **real device chord-track's** steps-region (cloned per track from
+`samples/11_multipattern_locklast/`) rendered correctly. So a structured field **somewhere in
+the undecoded ~498 varying bytes** of this region controls chord/voicing behaviour. Across all
+166 sample blocks, 188/695 bytes (27%) are constant; the rest vary (per-track state + still-
+undecoded parameters). **Decoding this region is the main open RE task** (monotonic sweeps).
+Single-note pitch locks and groove locks render fine regardless of this region.
 
 **Region layout (CONFIRMED):** after the 16-byte gate, at `run+0x4c`:
 `[groove list][pitch list][18 B pad][steps]`. The lists are variable-length, so **steps and
@@ -100,24 +134,32 @@ defaults; a per-step lock overrides them for that step.
 - "free" (non-fixed) division mode; track type (Note/CC/FX); mute/enable;
   per-step overrides (pitch/vel/sustain) + their "override active" flag.
 
-## Container detail: per-bank `.t1` (CONFIRMED via 5-block manual backup)
+## Container detail: per-bank `.t1` (CONFIRMED — fully reconstructed byte-exact)
 Verified: the 803-byte track block is **byte-identical** between the manual `.t1` and the
-autosave files. Layout of a per-bank `.t1` holding multiple patterns:
+autosave files. The whole container is now reproduced byte-for-byte across all 32 sample
+banks (`test_roundtrip.py`). Layout of a per-bank `.t1` holding multiple patterns:
 ```
 0x00  05 "2.1.4"                       magic + version (6 B)
-0x06  <tc0> 00 <npat> 00 00            first-pattern header: tc0=P0 track-count,
-                                       npat=number of patterns in bank (5 B)
-0x0b  P0 track blocks                  tc0 x 803 B
-      ── per following pattern ──
-      [8 B end-of-pattern trailer]     mostly zeros (a non-zero byte seen at +2)
-      [4 B pattern header] = <pat_idx> <tc> 00 00
-      <tc> track blocks                tc x 803 B
+0x06  <npat> 00 <tc0> 00 00            bank header: npat=#patterns serialized,
+                                       tc0=first-pattern track-count (5 B)
+0x0b  P0 track blocks                  tc0 blocks
+      ── per following serialized pattern ──
+      [8 B end-of-pattern trailer] = 00 00 <prev_tc-1> 00 00 00 00 00
+      [4 B next-pattern header]    = <slot> <tc> 00 00
+      <tc> track blocks
       ...
-      [8 B end-of-pattern trailer]
-0xEnd 78 00 00 00 <bank summary...> 6f 73 7c 74   bank trailer ("os|t")
+      [8 B end-of-last-pattern trailer] = 00 00 <last_tc-1> 00 00 00 00 00
+0xEnd [12 B bank summary] 6f 73 7c 74   bank trailer ("os|t")
 ```
-Block deltas in the 5-block sample: `803, 803, 815, 815` — the `815` (=803+12) gaps are the
-pattern boundaries (12 B = 8 B trailer + 4 B next-pattern header).
+- **`<slot>`** = the device pattern slot (0–15) of the upcoming pattern. Only **used**
+  patterns are serialized, so slots can be **sparse** (e.g. `04_pitch_vel_sustain` stores
+  slots 0 and 2 = Patterns 1 & 3). The first serialized pattern is implicitly slot 0.
+- **`prev_tc-1`** = (track-count of the pattern that just ended) − 1.
+- **Bank summary (12 B):** `78 00 00 00 00 <cur> <cur> 01 00 00 00 <cur>` where `<cur>` is
+  the **saved cursor** — the pattern slot selected when the backup was taken (user state, not
+  derivable from content; the device opens the bank on it). 0 is always valid.
+- A lock-bearing block's extra terminator byte (see above) lands inside these gaps, so the
+  pattern-boundary gap measures 12 (lock-free last block) or 13 (last block has locks).
 
 Autosave equivalent: one hash-named file per pattern (header `<tc> 00 00` + blocks +
 12 B `…os|t` trailer), a constant 14 B global file `05 "2.1.4" 00 00 00 00 os|t`, and (with
@@ -129,7 +171,7 @@ Autosave equivalent: one hash-named file per pattern (header `<tc> 00 00` + bloc
 |---------------|------|---------|--------|
 | `0x00`        | u8   | length of version string (`0x05`) | confirmed |
 | `0x01`–`0x05` | 5    | ASCII firmware version `"2.1.4"` | confirmed |
-| `0x06`        | u8   | **track-count** (0=empty; increments per serialized track block) | confirmed |
+| `0x06`        | u8   | **npat** (#patterns serialized; 0=empty bank). `0x08`=tc0 (first-pattern track-count). For single-pattern banks both read alike. | confirmed |
 | `0x07`–`0x22` | 28   | fixed skeleton / counts (see below) | partial |
 | `0x23`–`0x32` | 16   | **STEP / GATE array** — 1 byte per step, `0x01`=pulse, `0x00`=empty | confirmed |
 | `0x33`–`0x76` | 68   | zero padding | confirmed |
