@@ -45,6 +45,12 @@ SR_VELOCITY = F.S_VELOCITY
 SR_SUSTAIN = F.S_SUSTAIN
 SR_MIDIMASK = F.S_MIDIMASK             # u16 LE
 SR_ROOT = F.S_ROOT
+SR_STYLE = 0x13d                       # voicing Style: poly(chord)=0-4, mono(arp)=8-12; 0=Fixed
+# trailing per-block lock-summary (see FORMAT.md "TRUE chord blocker"): a lock-bearing block
+# carries `01 00 00 00 <K> 00` at steps+0x29c and ends `..00 01` instead of `..01 00`.
+SR_LOCK_FLAG = 0x29c                   # 1 = block has locks (else 0)
+SR_LOCK_CURSOR = 0x2a0                 # u16: cursor/last-edited locked step (cosmetic; use max)
+SR_END_MARK = 0x2b5                    # non-lock: 01 00 ; lock: 00 01
 
 PARAM_VELOCITY = 0x0a
 PARAM_SUSTAIN = 0x0e
@@ -74,7 +80,7 @@ def load_template(path):
 
 # ── track block synthesis ───────────────────────────────────────────────────────────
 def build_track_block(template, *, gate, pitches, steps, division, scale, root,
-                      velocity, sustain, mask, pitch_locks, groove_locks):
+                      velocity, sustain, mask, pitch_locks, groove_locks, end_mark=1):
     """Synthesize one 803+ byte track block by cloning `template` stored-state and
     patching the controllable fields + variable-length pitch/lock regions.
 
@@ -118,6 +124,19 @@ def build_track_block(template, *, gate, pitches, steps, division, scale, root,
     sr[SR_SUSTAIN] = sustain
     struct.pack_into("<H", sr, SR_MIDIMASK, mask)
     sr[SR_ROOT] = root
+    # If the block carries locks but the template's steps-region is a NON-lock one (its lock
+    # summary is absent), synthesize the trailing lock-summary the device requires; otherwise a
+    # lock-bearing block cloned from a non-lock template mis-renders (chords) and drops a later
+    # pattern. Skipped when the template already has the summary (e.g. self-templated roundtrip).
+    if (pitch_locks or groove_locks) and sr[SR_LOCK_FLAG] == 0:
+        locked_steps = set(pitch_locks) | set(groove_locks)
+        sr[SR_LOCK_FLAG] = 1
+        struct.pack_into("<H", sr, SR_LOCK_CURSOR, max(locked_steps))
+        # end-marker at +0x2b6 (Form Y). Its value is position-dependent within the pattern: the
+        # device drops a lock track whose value is wrong. Observed (device banks): first track=1,
+        # otherwise N-i (N tracks, index i) -> e.g. 3-track pattern = [1,2,1], 2-track = [1,1],
+        # 1-track = [1]. Caller passes end_mark; defaults to 1 (first/last/single).
+        sr[SR_END_MARK] = 0; sr[SR_END_MARK + 1] = end_mark
     b += sr
     if pitch_locks or groove_locks:
         b += b"\x00"                               # lock terminator byte (see FORMAT.md)
@@ -150,9 +169,18 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False)
     cur = max(0, min(current_pattern, 15))
     if final_has_locks:                         # patch the bank's final lock terminator
         fb = bytearray(patterns[-1][-1])        # build_track_block left a 0x00 terminator here
-        fb[-1] = len(patterns[-1]) - 1          # terminator byte = last_tc - 1
-        if npat > 1:
-            fb += b"\x00"                        # extra pad seen on multi-pattern banks
+        # The block's end-marker `01` must appear exactly ONCE near the tail. Two device-proven
+        # layouts: Form X (marker at the terminator position, region end-byte=0 → terminator =
+        # last_tc-1, e.g. samples/11) and Form Y (marker already at the region end-byte=1,
+        # terminator stays 0, e.g. device-authored iteration3). build_track_block writes Form Y
+        # for from-scratch lock blocks; only apply the Form-X terminator when the marker is NOT
+        # already at the region end-byte, else the two `01`s collide and the device rejects the
+        # whole bank. fb[-1]=appended terminator, fb[-2]=region end-byte (steps+0x2b6).
+        if fb[-2] == 0:                         # Form X: terminator carries the marker
+            fb[-1] = len(patterns[-1]) - 1      #   terminator = last_tc - 1
+            if npat > 1:
+                fb += b"\x00"                    #   + one pad byte (multi-pattern Form X only)
+        # Form Y (marker already at the region end-byte): leave terminator 0, no pad.
         patterns[-1][-1] = bytes(fb)
     out = bytearray(b"\x052.1.4")
     out += bytes([npat, 0, len(patterns[0]), 0, 0])
@@ -289,6 +317,14 @@ def map_channel_to_track(channel_notes, ppqn, div, length):
     default_sus = _most_common(list(step_sus.values()), 63)
 
     pitch_locks = {s: n for s, n in step_notes.items() if n != default_pitches}
+    # Device drops a single-note-default track that is only PARTIALLY pitch-locked (a pulsed step
+    # left playing the default while others are locked — hardware-confirmed). Device-authored
+    # banks lock EITHER no steps or ALL active steps for such tracks (samples/11 block1,
+    # handmade2 blk1). So once any lock is needed, lock every active step explicitly (same
+    # playback, just no implicit-default pulses). Chord-default tracks tolerate partial locks
+    # (handmade2 blk2), but locking all is always valid and keeps the rule simple.
+    if pitch_locks:
+        pitch_locks = dict(step_notes)
     groove_locks = {}
     for s in step_notes:
         gl = {}
@@ -309,18 +345,26 @@ def map_channel_to_track(channel_notes, ppqn, div, length):
 
 def midi_to_pattern(path, template, div, length):
     ppqn, notes = read_midi(path)
-    blocks = []
-    last_has_locks = False
+    # collect all track fields first so the per-track count N is known before building blocks
+    # (the lock-block end-marker at steps+0x2b6 is position-dependent: 1 for the first track,
+    # else N-i; a wrong value makes the device drop that track).
+    track_fields = []
     for chan in sorted(notes):                   # one track per channel, ascending
-        if len(blocks) >= 16:
+        if len(track_fields) >= 16:
             print(f"  warning: >16 channels in {path}; extra channels dropped")
             break
         fields = map_channel_to_track(notes[chan], ppqn, div, length)
         if fields is None:
             continue
         fields["mask"] = 1 << (chan - 1)
+        track_fields.append(fields)
+    n = len(track_fields)
+    blocks = []
+    last_has_locks = False
+    for i, fields in enumerate(track_fields):
+        end_mark = 1 if i == 0 else n - i
         last_has_locks = bool(fields["pitch_locks"] or fields["groove_locks"])
-        blocks.append(build_track_block(template, **fields))
+        blocks.append(build_track_block(template, end_mark=end_mark, **fields))
     return blocks, last_has_locks
 
 

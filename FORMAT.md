@@ -128,6 +128,88 @@ relative to `steps`: division +0x2a, scale +0x40, velocity +0x7b, sustain +0xa5,
 root +0x13f; `steps..block_end` = 0x2b7 bytes (fixed). Track-level vel/sustain/pitch are the
 defaults; a per-step lock overrides them for that step.
 
+**⚠️ Steps-region carved into TWO zones (CONFIRMED, iteration1 random-reroll experiment).**
+Tool: `t1_blockdiff.py` (aligns blocks to `run`, compares steps-region by `steps`-offset).
+Method: one track copied across 4 patterns, re-rolling exactly ONE parameter's random sequence
+per copy (per-parameter re-roll; Random amount 0 — the buffer still rewrites). `iteration1.zip`
+→ only **51 bytes changed, in 3 runs of exactly 17 bytes**, one per re-rolled param. Findings:
+- **Zone A = `steps+0x00 … ~0x150`: live per-track parameter table.** A sequence of
+  **`<value (1–2 B)> <17-byte random sequence>`** records, value-FIRST, zero-padded between.
+  Re-rolling a parameter rewrites only its 17-byte random run; the value byte stays put.
+  Confirmed value→random pairs: **steps**`@+0x00`, **div(u16)**`@+0x2a`, **scale**`@+0x40`,
+  **mask(u16)**`@+0xe4`, **root**`@+0x13f`; **Pitch-rnd**`@+0x55`, **Velocity** val`@+0x7b`/
+  rnd`@+0x7c`, **Sustain** val`@+0xa5`/rnd`@+0xa6` (vel value byte read 0x64=100, sus 0x3f=63,
+  matching the programmed track → these ARE the parameter records). ~8 more 17-byte random runs
+  (`+0x16,+0x68,+0x91,+0xbb,+0xd0,+0xfa,+0x110,+0x126`) = the other randomizable params
+  (Repeats/Cycles/Rotate/Phrase/Harmony/Chance/Timing/Accent…), each identifiable by re-rolling
+  it and seeing which run moves.
+- **Zone B = `steps+0x150 … 0x296`: `00 00 00 <id> 00 64 <17 B>` array**, ids `0x46..0x52`
+  (terminated by id `0x53` + zero pad). This array **did NOT change on track-param re-roll** →
+  it is **not** the track random buffer (likely per-step / "locked random" state). Earlier RE
+  mistakenly flagged this as the random region — it is a separate structure.
+- **Semantics confirmed:** "copy pattern" **preserves** random sequences (else all runs would
+  differ); per-parameter re-roll is **surgical** (one run); re-roll works at Random=0.
+- **Implication:** ~15×17 ≈ 255 bytes of Zone A are pure random buffer the importer may clone
+  freely; the **value/structure bytes between them** hold the still-undecoded params.
+
+**✅ STYLE decoded (iteration2 Style-sweep, `t1_blockdiff.py --sweep`).** One track (3-note
+chord default) copied across 10 patterns with Style = VB1..VB5 then VB9..VB13. **Exactly one
+byte changed: `steps+0x13d`**, values `[0,1,2,3,4, 8,9,10,11,12]` = `VB_index − 1`. So:
+**Style @ `steps+0x13d`; polyphonic (chord) = 0–4, monophonic (arp) = 8–12; Fixed-poly = 0.**
+(Voicing = motion amount, a separate value, not yet located.) The importer should write `0`.
+
+**❌ Style is NOT the chord blocker (hypothesis tested & rejected).** Both the proven-broken
+`hwtest/hwtest.t1` and the proven-working `hwtest/hwtest_handtmpl.t1` have **Style=0** on the
+chord track. Masking the 29 known random runs, the **only** structural difference between
+broken and working chord blocks is a **trailing lock-summary**:
+
+**✅ TRUE chord blocker = trailing per-block LOCK-SUMMARY (steps+0x29c), and it's UI/cursor
+state — not structural.** After Zone B's `…53` terminator (steps+0x295), a **lock-bearing**
+block carries `01 00 00 00 <K> 00` at `steps+0x29c`, and ends with a `00 01` marker at
+`steps+0x2b5/+6` (a non-lock block has this region all-zero and ends `01 00`). Decoded via
+iteration3 (samples/14), a 2-pattern bank of identical chord-lock tracks with locks entered in
+a controlled order:
+- `+0x29c` (**A**) = `1` whenever locks are present (the record exists); `0` = non-lock.
+- `+0x2a0` (**K**) = **newest-stored / last-edited lock step** (cursor). All iteration3 blocks
+  read K=12 (locks entered 1→5→9→13 → newest = step 13 = 0-based 12). The earlier `samples/11`
+  K=8-on-[0,4,8,12] "anomaly" was just hand-edit order.
+- `+0x2b5/+0x2b6` = end-marker (`00 <m>`). **`+0x2b6` (m) is STRUCTURAL, position-dependent —
+  NOT cosmetic** (a wrong value makes the device silently DROP that track on load,
+  hardware-confirmed). Rule from device banks: `m = 1` for the first track of a pattern, else
+  `N - i` (N tracks, index i) → 3-track pattern = `[1,2,1]`, 2-track = `[1,1]`, 1-track = `[1]`.
+  A is `1` whenever locks present (the `samples/11` A=2 final-block case is the Form-X variant,
+  below); K is cursor state (any in-range locked step loads).
+
+**Why a lock track loads or drops (all hardware-confirmed):**
+1. A lock-bearing block must have the summary **present** (A=1 + the record), not the non-lock
+   template's all-zero region. (Old bank cloned a non-lock template → A=0 → whole-bank reject.)
+2. A **single-note-default (pc=1)** track must be **fully** pitch-locked or not at all — a
+   PARTIAL lock (some pulsed steps left on the default) drops the track. (Chord-default pc≥2
+   tracks tolerate partial locks — `handmade2` blk2.) Importer locks every active step once any
+   lock is needed.
+3. The end-marker `+0x2b6` must equal the position value above, or the track drops.
+**Fix (shipped, HARDWARE-VERIFIED):** `midi_to_t1.build_track_block` writes the summary
+(A=1, K=max locked step, end-marker = position value passed by `midi_to_pattern`) when a lock
+block uses a non-lock template; `map_channel_to_track` locks all active steps when any pitch
+lock is needed; skipped for self-templated blocks so roundtrip stays byte-exact.
+
+**⚠️ Final lock block: the `01` end-marker must appear EXACTLY ONCE (device rejects the whole
+bank otherwise).** A lock block's tail has a single `01` marker; there are two device-proven
+layouts, distinguished by where the marker sits relative to the lock terminator byte:
+- **Form Y** (device-authored `iteration3`, all blocks): marker at the region end-byte
+  `steps+0x2b6`, lock terminator = `00`, NO multi-pattern pad. Tail `…00 01 00`. Summary A=1.
+- **Form X** (`samples/11`, `hwtest_handtmpl`): region end-byte `steps+0x2b6`=`00`, lock
+  terminator = `last_tc-1`, +1 pad byte on multi-pattern banks. Tail `…00 00 01 (00)`. Summary
+  A=2, `+0x2a1`=4. (The "final terminator = last_tc-1" rule from earlier RE is just Form X.)
+The first synthesized bank FAILED on device (whole-bank reinitialise) because the importer set
+the marker at `+0x2b6` (Form Y) AND stamped `last_tc-1` at the terminator (Form X) → two
+adjacent `01`s. **Fix:** `build_bank` applies the Form-X terminator+pad ONLY when the final
+block's region end-byte is 0 (template-cloned/roundtrip); a from-scratch lock block keeps Form Y
+(terminator 0, no pad). The regenerated bank now matches `iteration3` byte-for-byte per block
+(Form Y); `hwtest/hwtest_locksummary.t1` + `project_locksummary.zip`. **HARDWARE-VERIFIED: a
+fully-synthesized bank with single-note, scale, chord, velocity-ramp and sustain tracks across 2
+patterns loads and renders correctly on device.**
+
 ### Still open (for full-fidelity export)
 - scale+root **quantization** of playback (exporter currently emits raw absolute pitch;
   standard scale tables need confirming, esp. Iwato snap direction and "Tetra");

@@ -7,10 +7,12 @@ Reverse-engineering the Torso T-1 sequencer's backup format to import/export pat
   Handles pulses, loop length, per-track timing/division, track pitch + chords, per-step
   pitch locks (incl. chords), velocity + per-step locks, sustain + per-step locks,
   multi-channel routing, root, scale.
-- **`MIDI → .t1` importer: WORKING, hardware-verified** for: bank loading, channel routing,
-  gates, single-note pitch locks, velocity, sustain, multi-pattern containers. Proven by
-  `test_roundtrip.py` (**all 33 sample banks rebuild byte-for-byte**, incl. the new
-  `11_multipattern_locklast`) **and on real hardware** (`hwtest/`, see below).
+- **`MIDI → .t1` importer: WORKING, hardware-verified — INCLUDING CHORDS** (multi-note pitch
+  locks render as block chords on device, from a synthesized non-lock template — no per-track
+  device-template cloning needed). Covers: bank loading, channel routing, gates, single-note +
+  chord pitch locks, velocity, sustain, multi-pattern containers. Proven by `test_roundtrip.py`
+  (**all sample banks rebuild byte-for-byte**) **and on real hardware** (`hwtest/project_locksummary.zip`
+  loaded & rendered correctly: 2 patterns × {single-note, scale, chords, velocity-ramp, sustain}).
 - **Fixes / choices made during hardware verification:**
   1. **Final-block lock terminator** (CONFIRMED format rule, invisible to parser/roundtrip — no
      sample exercised it): the bank's last block, if it carries locks, uses a terminator byte =
@@ -23,13 +25,18 @@ Reverse-engineering the Torso T-1 sequencer's backup format to import/export pat
      byte-identical across pc=1/2/3 (no secondary count field). Our earlier `pc=3` load-failure
      with the *synthesized* template is **unexplained** (likely a stored-state interaction) and
      is folded into the open RE below — do not treat "chords need pc=1" as a rule.
-- **⚠️ OPEN BLOCKER — the per-track stored-state region governs chord rendering.** The 695-byte
-  steps-region we clone from a template is **not inert**: a structured field in its ~498
-  undecoded bytes controls how multi-note pitch locks (chords) render. A bank built with a
-  *synthesized* template's stored-state **loads but mis-renders chords + drops a later pattern**;
-  cloning a **real device chord-track's** stored-state (per track) renders correctly — proven by
-  `hwtest/hwtest_handtmpl.t1` loading perfectly on device. **Only 9 of 695 offsets are decoded.**
-  Decoding this region is the main remaining RE task (see Next steps).
+- **✅ CHORD BLOCKER RESOLVED (was: per-track stored-state region).** Decoded via 3 random-reroll
+  / sweep backups (`samples/12–14`, tool `t1_blockdiff.py`). The steps-region splits into
+  **Zone A** = per-param `<value><17-B random seq>` records (random buffer the importer may clone
+  freely) and a **trailing per-block lock-summary** at `steps+0x29c`. The blocker was NEVER about
+  chord *voicing* — Style lives at `steps+0x13d` (poly 0-4 / mono 8-12) and was already 0. Three
+  real, hardware-confirmed rules govern whether a lock track loads (all now handled by the importer):
+  1. lock blocks need the summary present (`+0x29c`=1), not the non-lock template's zeros;
+  2. a pc=1 (single-default) track must be fully or not-at-all pitch-locked (no partial);
+  3. the end-marker `steps+0x2b6` is position-dependent (`1` first track, else `N-i`).
+  The final-block end-marker must not collide with the Form-X terminator (`build_bank` handles).
+  See FORMAT.md "TRUE chord blocker" / "Final lock block". ~Most of the 695 bytes are now
+  accounted for (random buffer + decoded params + lock-summary); remaining unknowns are minor.
 - Format byte-map is documented in **`FORMAT.md`** (read it first). Container, lock terminators
   (incl. final-block exception), groove `entry_count` packing, bank summary/cursor, and the
   stored-state-region findings are all there.
