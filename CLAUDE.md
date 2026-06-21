@@ -65,7 +65,10 @@ was the trailing lock-summary + load rules (resolved; see FORMAT.md).
 - `midi_to_t1.py` — importer. `python3 midi_to_t1.py -o OUT.t1 IN1.mid [IN2.mid …]`
   `[--div 16] [--length N] [--template FILE]`. Each `.mid` → one pattern; each MIDI channel
   with notes → one track; chords/pitch-changes → pitch locks; per-step velocity/length →
-  groove locks. Scale/root default Chromatic/C (absolute pitch plays exactly).
+  groove locks. Scale/root default Chromatic/C (absolute pitch plays exactly). **Imports a
+  single 16-step base cycle only — it does NOT yet emit cycles or steps>16 from MIDI** (the
+  *synthesis* primitives exist; only the MIDI→cycle mapping is missing — see "Cycles in MIDI
+  import" under Next steps).
 - `test_roundtrip.py` — self-test: rebuilds every sample bank byte-for-byte (run after any
   change to the block/container synthesis or the parser). Now includes the multi-pattern/
   lock-last regression (`samples/11_multipattern_locklast/handmade.t1`).
@@ -178,8 +181,27 @@ are decoded and the importer is hardware-verified. Method/tooling that worked: `
 (random re-roll to isolate the buffer, then sweeps); experiments in `samples/12–14`; full decode
 in FORMAT.md. The remaining steps-region work is now optional polish, not a blocker:
    - Name the other ~8 Zone-A random sequences (re-roll each parameter; see FORMAT.md Zone A).
-   - Sweep remaining params (Repeats, Cycles, Rotate, Phrase, Harmony, Chance…) to expose them as
-     importer features, using the manual + monotonic sweeps.
+   - Sweep remaining params (Repeats, Rotate, Phrase, Harmony, Chance…) to expose them as
+     importer features, using the manual + monotonic sweeps. (Cycles + Steps are done.)
+
+**Cycles in MIDI import (not started — the only missing piece is the MIDI→cycle MAPPING).**
+The *byte synthesis* is DONE and hardware-verified: `build_track_block` already accepts
+`steps` (1-64), `step_group`, and `cycles`/`cycle_pitch`/`cycle_records`/`cycle_params` (see its
+docstring + FORMAT.md "STEPS up to 64 + CYCLES"). `make_cycle_hwtest.py`'s `track()` helper is a
+**worked, hardware-verified example** of turning a high-level per-cycle spec into those kwargs —
+copy its shape. What's missing is in `map_channel_to_track`/`midi_to_pattern`, which today emit
+only a single 16-step base cycle (`cycles=4`, no per-cycle data). To add cycles you must:
+1. **Decide how a `.mid` expresses cycles** (the real open question — MIDI has no cycle concept).
+   Options: one `.mid`/clip per cycle; a marker-meta convention; or N×length bars where bar *k* =
+   cycle *k*. Then diff each cycle against the base and emit only the deltas.
+2. Translate those deltas to the kwargs, respecting the decoded rules:
+   - cycle indices are **0-based**, stored **descending**; **every edited cycle needs a step-seq
+     record** (gate = base gate if unchanged) even if only its pitch/param changed;
+   - per-cycle **track pitch** → `cycle_pitch` (header); **sustain/steps/division/scale/vel/root**
+     → `cycle_params` (ids in FORMAT.md); **gate + per-step locks** → `cycle_records`;
+   - a per-step lock only sounds if **that cycle's gate has a pulse on that step**;
+   - pass the right `end_mark` (i+1, last track of pattern = 1) — `midi_to_pattern` already does.
+3. Also wire steps>16 and `step_group` through `map_channel_to_track` (currently capped at 16).
 
 **Priority 2 — importer polish**: velocity/sustain on the N×8 grid + sustain default 64 (see
 above); fold the **backup-zip builder** into `midi_to_t1.py` (`--zip`/`--slot`); scale/root
