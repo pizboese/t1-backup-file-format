@@ -2,7 +2,15 @@
 
 Reverse-engineering the Torso T-1 sequencer's backup format to import/export patterns as MIDI.
 
+> **Branch: work on `main` directly** until a stable baseline is established (do not branch per
+> change for now). Commit freely to `main`.
+
 ## Goal & current status
+- **Steps 1-64 + Cycles: DECODED, synthesized, and HARDWARE-VERIFIED** (`make_cycle_hwtest.py`
+  → `hwtest/project_cycle_hwtest.zip` loaded & rendered correctly on device). 64-byte gate,
+  cycle count, step-group page, per-cycle pitch/param/step-seq overrides; the per-pattern
+  end-marker rule and saved cursors are nailed down. Sources archived in `samples/15`, `samples/16`;
+  both device banks rebuild byte-for-byte (`test_roundtrip.py`). See FORMAT.md.
 - **`.t1 → MIDI` exporter: DONE** and verified end-to-end (incl. on-device round-trip).
   Handles pulses, loop length, per-track timing/division, track pitch + chords, per-step
   pitch locks (incl. chords), velocity + per-step locks, sustain + per-step locks,
@@ -61,7 +69,13 @@ was the trailing lock-summary + load rules (resolved; see FORMAT.md).
 - `test_roundtrip.py` — self-test: rebuilds every sample bank byte-for-byte (run after any
   change to the block/container synthesis or the parser). Now includes the multi-pattern/
   lock-last regression (`samples/11_multipattern_locklast/handmade.t1`).
+- `t1_cycles.py` — decode steps-to-64 + the **cycles** feature: `python3 t1_cycles.py FILE.t1`
+  prints per-track cycle count, step-group page, per-cycle track-pitch overrides, and per-cycle
+  step-sequence records (gate + per-step pitch/groove locks). See FORMAT.md "STEPS up to 64 + CYCLES".
 - `t1_annotate.py` — raw RE helper: `show` / `diff A B` / `sweep F…` (monotonic-byte finder).
+- `make_cycle_hwtest.py` — synthesizes a from-scratch steps-64 + cycles bank and splices it into
+  a real backup → `cycle_hwtest.t1` + `project_cycle_hwtest.zip` (device-loadable). Proves cycle
+  *synthesis* (the two device cycle banks rebuild byte-for-byte in `test_roundtrip.py`).
 - `make_hwtest_midi.py` — generates the dependency-free test MIDI (`hwtest/p1_routing.mid`,
   `hwtest/p2_dynamics.mid`) used for hardware verification.
 
@@ -105,6 +119,9 @@ Then the user restores `project.zip` via the T-1 Backup menu. (Restore overwrite
 settings, so always splice into a real backup — never ship a zip with only your test bank.)
 
 ## `hwtest/` — hardware-verification working set
+- `cycle_hwtest.t1`, `project_cycle_hwtest.zip` — **from-scratch steps-64 + cycles bank +
+  spliced backup; HARDWARE-VERIFIED** (2 patterns, rising complexity: step counts, cycle counts,
+  per-cycle pitch/param/gate/per-step edits). Regenerate with `python3 make_cycle_hwtest.py`.
 - `p1_routing.mid` / `p2_dynamics.mid` — test patterns (routing+pitch+chords / velocity+sustain).
 - `hwtest_locksummary.t1`, `project_locksummary.zip` — **current importer output + spliced backup;
   HARDWARE-VERIFIED** (chords + all load-rules render correctly from a synthesized template).

@@ -171,10 +171,16 @@ a controlled order:
 - `+0x2a0` (**K**) = **newest-stored / last-edited lock step** (cursor). All iteration3 blocks
   read K=12 (locks entered 1→5→9→13 → newest = step 13 = 0-based 12). The earlier `samples/11`
   K=8-on-[0,4,8,12] "anomaly" was just hand-edit order.
-- `+0x2b5/+0x2b6` = end-marker (`00 <m>`). **`+0x2b6` (m) is STRUCTURAL, position-dependent —
-  NOT cosmetic** (a wrong value makes the device silently DROP that track on load,
-  hardware-confirmed). Rule from device banks: `m = 1` for the first track of a pattern, else
-  `N - i` (N tracks, index i) → 3-track pattern = `[1,2,1]`, 2-track = `[1,1]`, 1-track = `[1]`.
+- end-marker = position value `m` (STRUCTURAL — a wrong value makes the device silently DROP or
+  mis-slot the track, hardware-confirmed). It sits at **`steps+0x2b5` on a NON-lock block**
+  (`+0x2b6`=0) and at **`steps+0x2b6` on a LOCK block** (`+0x2b5`=0). Synthesis must set the
+  right one for **both** kinds — leaving a non-lock block's `+0x2b5` at the template's `1`
+  dropped every position-≥2 non-lock track on device (iteration-10-hwtest v1). **Rule (corrected via iter9/iter10, N up to 12): `m = i + 1` for every
+  track except the pattern's LAST, which is `1`** (Form Y) — e.g. 8-track pattern =
+  `[1,2,3,4,5,6,7,1]`, 12-track = `[1,2,…,11,1]`, 3-track = `[1,2,1]`, 1-track = `[1]`. (The
+  earlier `N − i` rule only *coincided* for N ≤ 3, which is all the first hwtest patterns had;
+  it is wrong for N > 3.) The bank's final block may instead be Form X (`m = 0`, marker carried
+  by the terminator) — see "Final lock block".
   A is `1` whenever locks present (the `samples/11` A=2 final-block case is the Form-X variant,
   below); K is cursor state (any in-range locked step loads).
 
@@ -213,6 +219,126 @@ patterns loads and renders correctly on device.**
   standard scale tables need confirming, esp. Iwato snap direction and "Tetra");
 - "free" (non-fixed) division mode; track type (Note/CC/FX); mute/enable;
   per-step overrides (pitch/vel/sustain) + their "override active" flag.
+
+## STEPS up to 64 + CYCLES (DECODED, `iteration9.zip`, 2026-06-21)
+Source backup `iteration9.zip` (bank `0.t1`, 20 blocks): Pattern 1 = 8 tracks exercising
+**step count 16/32/48/64** + the **step-group page selector**; Pattern 2 = 12 tracks
+exercising **cycles** (count 1–16, plus per-cycle edits of pitch / sustain / steps-length /
+gate / per-step locks, on single and multiple cycles). Tool: `t1_cycles.py` (in repo).
+Manual refs: `…/shape/steps` and `…/shape/cycles`.
+
+### Steps 1–64 — the gate array is a FIXED 64 bytes (CONFIRMED)
+The "16-byte gate" was always a **64-byte** region: `run+0x0c … run+0x4c` (0x40 = 64 B), one
+byte per step (`01`=pulse). It is step-count-independent — `OFF_LOCKS = run+0x4c` sits exactly
+after it, which is why `steps`/division/etc. parsed correctly even for 32/48/64-step tracks.
+The old parser only *read* the first 16; **read all 64** (clamp the live range to the `steps`
+field). `steps` (track length, **1–64**, default 16) is the `steps+0x00` field as before.
+- **Random sequences stay 16 long** regardless of track length (per manual) — Zone-A's
+  17-byte runs are unchanged by step count; only the gate widens.
+- **Step-group page selector** (UI cursor: which 16-step page is shown) = **`steps+0x2b0`**,
+  0-based: `0`=steps 1–16 ([BANK]), `1`=17–32 ([PATTERN]), `2`=33–48 ([TEMP]), `3`=49–64
+  ([MUTE]). Proven: Pattern-1 t5–t8 (all 16 steps) read 0,1,2,3 for selector 1/2/3/4. Cursor
+  state only — does not affect playback; safe to write 0.
+
+### Cycles 1–16 (default 4) — per-track variation engine (DECODED)
+Each track loops through N **cycles**; each cycle can override track-level params and per-step
+data. A "default" cycle is unmodified. Storage is split across THREE places in the block:
+
+**1. Cycle COUNT** (1–16, default 4) = **`steps+0x14d`** (u8). CONFIRMED: reads 1,2,3,4,…,16
+across Pattern-2 tracks exactly. (Note: the byte at `steps+0x2b5` is the **position end-marker**
+documented earlier, NOT the cycle count — they coincided only because tracks 1–4 had cycle
+count == track index.)
+
+**2. Per-cycle TRACK-PITCH overrides** — appended **in the header, right after the base pitch
+list** (and before the `…0c 00 00 00` separator that precedes `run`):
+```
+[num_pitch_overrides:u8]  then per override: [cycle_idx:u8 0-based] [pitch_count:u32 LE] [pitch:u8 …]
+```
+Stored **descending** by cycle index; `pitch_count` supports chords (same encoding as a per-step
+pitch lock). CONFIRMED end-to-end:
+- cycle1→D3: `… 3c | 01 | 00 01000000 3e` (base C3, 1 override, cyc 0 = D3).
+- cycle2&4→D3: `… 3c | 02 | 03 01000000 3e | 01 01000000 3e` (cyc 3 then cyc 1).
+- cycle16→D3: `… 3c | 01 | 0f 01000000 3e`.
+- cycle8→C3,E3,G3 chord: `… 3c | 01 | 07 03000000 3c 40 43`.
+(No override ⇒ a single `00`, which is the normal lock-free header — that `00` is this count.)
+
+**3. Per-cycle STEP-SEQUENCE records + param overrides** — inserted in the **lock region**,
+right after the base groove/pitch lock counts (`run+0x4c`,`run+0x4d`) and **before `steps`**
+(so `steps` and everything after it shifts later — this is why the old parser returned garbage
+on edited-cycle tracks). Layout:
+```
+run+0x4c  [base groove_lock_count]          ← the existing base-track lock lists
+run+0x4d  [base pitch_lock_count]
+run+0x4e  [num_edited_cycles:u8]
+          num_edited_cycles × per-cycle RECORD (67 B when minimal):
+              [cycle_idx:u8 0-based]
+              [64-byte gate]                 ← that cycle's own pulse pattern
+              [groove_lock_count + groove locks]   ← per-step vel/sustain for this cycle
+              [pitch_lock_count  + pitch  locks]   ← per-step pitch/chord for this cycle
+          [per-cycle TRACK-PARAM override section]  ← non-pitch track defaults per cycle
+          [18-byte pad] [steps] …
+```
+The per-cycle gate + lock lists reuse the **identical** base-track formats (gate 64 B; groove
+lock `[entry_count][step] then n×[param][value][00 00 00]`; pitch lock `[step][count:u32][pitches]`).
+CONFIRMED examples:
+- cycle16 "steps 1–8": record gate = `01 01 01 01 01 01 01 01 00…` (pulses 1–8).
+- cycle1 per-step chord on step1: record's pitch-lock list = `…00(groove=0) 01(pitch=1) 00 03000000 3c 40 43` (step0 → C3,E3,G3).
+- cycle2 per-step step1 vel16/sus16: record's groove list = `01 02 00 0e 7f 00 00 00 0a 7f 00 00 00` (1 lock, 2 entries on step0: sustain 0x7f + velocity 0x7f).
+- Two edited cycles (block 14) ⇒ two 67-B records back-to-back (`num_edited_cycles=2`),
+  cycle indices descending; +67 B of block size per edited cycle.
+
+**Per-cycle TRACK-PARAM override section** (DECODED, `iteration10.zip` dual sweep) — non-pitch
+track defaults (steps-length / division / scale / velocity / sustain / root …) that differ for
+one cycle, stored at the **start of the 18-byte pad right before `steps`** (all-zero = no
+override). It reuses the **groove-lock list format**, keyed by cycle instead of step:
+```
+[num_records:u8]
+   per record: [entry_count:u8] [cycle_idx:u8 0-based]
+               then entry_count × [param_id:u8] [value:u16 LE] [00 00]
+```
+The 5-byte entry is `[param][value:u16][00 00]` — the **value is u16 LE** (proven by a per-cycle
+division=/1 → 384 = `80 01`; velocity/sustain just have a 0 high byte, which is why the groove
+form historically read as `[param][value:u8][00 00 00]`). **Param-id table** (confirmed; shared
+with groove locks — vel/sus ids match):
+
+| id | param | value | id | param | value |
+|----|-------|-------|----|-------|-------|
+| `0x00` | steps (length) | 1–64 | `0x0a` | velocity | 0–127 |
+| `0x04` | division | ticks/step (value×div=384) | `0x0e` | sustain | 0–127 |
+| `0x06` | scale | 0=Chrom,1=Maj,… | `0x22` | root | 0=C…11=B |
+
+CONFIRMED bytes (all on cycle 2 except the cycle sweep): `01 01 02 0a 7f 00 00`=cyc3 vel127,
+`01 01 01 0e 7f 00 00`=cyc2 sus127, `01 01 01 00 08 00 00`=cyc2 steps8, `01 01 01 04 80 01 00`=
+cyc2 div/1 (384), `01 01 01 06 01 00 00`=cyc2 scale Major, `01 01 01 22 02 00 00`=cyc2 root D.
+A cycle-index sweep (sustain on cycles 1/2/3/4) read `cycle_idx` = 0,1,2,3 at byte 3. A
+pitch-only edited cycle still gets its 67-B gate record but an *empty* (all-zero) param pad
+(its pitch lives in the header).
+
+**✅ Cycles decode + SYNTHESIS are COMPLETE.** Header pitch overrides + per-cycle step-seq
+records + the param-override section are all confirmed against device backups, and
+`midi_to_t1.build_track_block` now *emits* them: `test_roundtrip.py` rebuilds the two
+device-authored cycle banks (iteration9, iteration10) **byte-for-byte**, and a fully
+from-scratch cycle bank (`make_cycle_hwtest.py` → `cycle_hwtest.t1`) is self-consistent.
+Lock-region layout for synthesis (after the base lock lists): `[num_edited_cycles]` then per
+cycle `[cycle_idx][64-B gate][groove locks][pitch locks]`, then `[param_num][param records]`,
+then a **16-B** pad, then `steps` (the historical "18-B pad" = `num_edited_cycles=0` +
+`param_num=0` + 16 zeros). A block has its lock terminator + lock-summary when ANY base **or**
+per-cycle record carries per-step locks.
+
+### Open / needs another targeted backup
+- ~~param-id table for per-cycle track-param overrides~~ — **DONE** (iteration10, table above).
+- The 2-byte tail after the last per-cycle record / interaction with the existing end-marker &
+  final-block Form-X/Y rules when cycle records are present in the bank's last block.
+- Importer/exporter support: the exporter can now *read* steps-64 + cycles; **synthesis**
+  (MIDI→.t1) of cycles is not implemented (would need MIDI conventions for per-cycle variation).
+
+### Saved pattern cursor — CONFIRMED ISOLATED (`iteration10` banks 1 & 2)
+The "which pattern was selected when the backup was saved" cursor is the 0-based pattern **slot**,
+stored **only** in the 12-B bank summary: `78 00 00 00 00 <cur> <cur> 01 00 00 00 <cur>` (3 copies
+at summary offsets 5,6,11). Proven: two banks identical but for the selected pattern (P2 vs P1)
+differed in **exactly those 3 bytes** (`01` vs `00`) — everything else is per-track random state.
+It touches no track/pattern content; `build_bank(current_pattern=…)` already emits it. Safe to
+set 0.
 
 ## Container detail: per-bank `.t1` (CONFIRMED — fully reconstructed byte-exact)
 Verified: the 803-byte track block is **byte-identical** between the manual `.t1` and the

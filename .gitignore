@@ -3,3 +3,9 @@ __pycache__/
 
 # Windows "downloaded from" metadata streams
 *Zone.Identifier
+
+# IDE
+.idea/
+
+# scratch MIDI working dir
+midi/

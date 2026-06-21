@@ -51,6 +51,9 @@ SR_STYLE = 0x13d                       # voicing Style: poly(chord)=0-4, mono(ar
 SR_LOCK_FLAG = 0x29c                   # 1 = block has locks (else 0)
 SR_LOCK_CURSOR = 0x2a0                 # u16: cursor/last-edited locked step (cosmetic; use max)
 SR_END_MARK = 0x2b5                    # non-lock: 01 00 ; lock: 00 01
+SR_CYCLES = F.S_CYCLES                 # 0x14d: cycle count (1-16, default 4)
+SR_STEPGROUP = F.S_STEPGROUP           # 0x2b0: step-group page selector (0-3)
+GATE_LEN = F.GATE_LEN                  # 64: full gate array (steps 1-64)
 
 PARAM_VELOCITY = 0x0a
 PARAM_SUSTAIN = 0x0e
@@ -78,42 +81,78 @@ def load_template(path):
     return filler_a, steps_region
 
 
+# ── lock-list serialization (shared by base track AND per-cycle records) ──────────────
+def _groove_bytes(groove_locks):
+    """Serialize a groove-lock list. `groove_locks` = {step0: {'velocity'|'sustain': value}}
+    or {step0: {param_id:int: value}} (raw). Newest/step-desc first; one record per step packs
+    all its params: [entry_count][step] then N*[param][value:u16 LE][00 00]."""
+    out = bytearray([len(groove_locks)])
+    for step, gl in sorted(groove_locks.items(), reverse=True):
+        out += bytes([len(gl), step])
+        for name, value in gl.items():
+            pid = name if isinstance(name, int) else GROOVE_PARAM_CODE[name]
+            out += bytes([pid]) + struct.pack("<H", value) + b"\x00\x00"
+    return bytes(out)
+
+
+def _pitch_bytes(pitch_locks):
+    """Serialize a pitch-lock list: [count] then per step-desc [step][count:u32 LE][notes]."""
+    out = bytearray([len(pitch_locks)])
+    for step, notes in sorted(pitch_locks.items(), reverse=True):
+        out += bytes([step]) + struct.pack("<I", len(notes)) + bytes(notes)
+    return bytes(out)
+
+
 # ── track block synthesis ───────────────────────────────────────────────────────────
 def build_track_block(template, *, gate, pitches, steps, division, scale, root,
-                      velocity, sustain, mask, pitch_locks, groove_locks, end_mark=1):
+                      velocity, sustain, mask, pitch_locks, groove_locks, end_mark=1,
+                      cycles=4, step_group=0, cycle_pitch=None, cycle_records=None,
+                      cycle_params=None):
     """Synthesize one 803+ byte track block by cloning `template` stored-state and
-    patching the controllable fields + variable-length pitch/lock regions.
+    patching the controllable fields + variable-length pitch/lock/cycle regions.
 
-    gate          : iterable of up to 16 ints (0/1)
+    gate          : iterable of up to 64 ints (0/1) — full step range
     pitches       : track-default pitch list (>=1 absolute notes, C3=60)
-    pitch_locks   : {step0: [notes]}      per-step pitch overrides (incl. chords)
-    groove_locks  : {step0: {'velocity'|'sustain': value}}  per-step groove overrides
+    pitch_locks   : {step0: [notes]}      base per-step pitch overrides (incl. chords)
+    groove_locks  : {step0: {'velocity'|'sustain': value}}  base per-step groove overrides
+    cycles        : cycle count 1-16 (default 4)
+    step_group    : step-group page selector 0-3 (UI cursor)
+    cycle_pitch   : [(cyc_idx, [notes]), ...] per-cycle TRACK-pitch overrides (stored order)
+    cycle_records : [(cyc_idx, gate64, groove_locks, pitch_locks), ...] per-cycle step-seq records
+    cycle_params  : [(cyc_idx, [(param_id, value), ...]), ...] per-cycle TRACK-param overrides
+    See FORMAT.md "STEPS up to 64 + CYCLES". Defaults reproduce a plain (no-cycle) block exactly.
     """
-    filler_a, steps_region = template
-    gate = list(gate)[:16] + [0] * max(0, 16 - len(gate))
+    _, steps_region = template
+    gate = list(gate)[:GATE_LEN] + [0] * max(0, GATE_LEN - len(gate))
+    cycle_pitch = list(cycle_pitch or [])
+    cycle_records = list(cycle_records or [])
+    cycle_params = list(cycle_params or [])
 
     b = bytearray()
     b += b"\x0c\x00" + bytes([len(pitches)]) + b"\x00\x00\x00"   # block marker + pitch count
-    b += bytes(pitches)                                          # pitch list (variable)
-    b += b"\x00\x0c\x00\x00\x00"                                 # post-pitch constant
+    b += bytes(pitches)                                          # base pitch list (variable)
+    b += bytes([len(cycle_pitch)])                              # per-cycle pitch override count
+    for cyc, notes in cycle_pitch:                              # [cyc_idx][count:u32][notes]
+        b += bytes([cyc]) + struct.pack("<I", len(notes)) + bytes(notes)
+    b += b"\x0c\x00\x00\x00"                                     # post-pitch separator
     b += RUN                                                     # 00..0b landmark
-    b += bytes(gate)                                             # 16-byte gate array
-    b += filler_a                                               # 48-byte stored filler
+    b += bytes(gate)                                             # 64-byte gate array
 
-    # lock region: groove list, pitch list, 18-byte pad (lists stored newest/step-desc first).
-    # A groove record packs all params for one step: [entry_count][step] + N*[param value 00 00 00].
-    glocks = sorted(groove_locks.items(), reverse=True)          # step-desc
-    b += bytes([len(glocks)])
-    for step, gl in glocks:                                       # gl order preserved (newest-first)
-        b += bytes([len(gl), step])
-        for name, value in gl.items():
-            b += bytes([GROOVE_PARAM_CODE[name], value, 0, 0, 0])
-
-    plocks = sorted(pitch_locks.items(), reverse=True)           # step-desc
-    b += bytes([len(plocks)])
-    for step, notes in plocks:
-        b += bytes([step]) + struct.pack("<I", len(notes)) + bytes(notes)
-    b += b"\x00" * PAD_AFTER_LOCKS
+    # lock region: base groove + pitch lists, then per-cycle step-seq records, then per-cycle
+    # track-param overrides, then a 16-byte pad (see FORMAT.md). With no cycles this is exactly
+    # the historical `[groove][pitch] + 18 zero pad` (num_edited=0, param_num=0, 16 zeros).
+    b += _groove_bytes(groove_locks)
+    b += _pitch_bytes(pitch_locks)
+    b += bytes([len(cycle_records)])                            # num_edited_cycles
+    for cyc, cgate, cgroove, cpitch in cycle_records:
+        cgate = list(cgate)[:GATE_LEN] + [0] * max(0, GATE_LEN - len(cgate))
+        b += bytes([cyc]) + bytes(cgate) + _groove_bytes(cgroove) + _pitch_bytes(cpitch)
+    b += bytes([len(cycle_params)])                            # param-override record count
+    for cyc, entries in cycle_params:                          # [entry_count][cyc] + 5B entries
+        b += bytes([len(entries), cyc])
+        for pid, value in entries:
+            b += bytes([pid]) + struct.pack("<H", value) + b"\x00\x00"
+    b += b"\x00" * 16
 
     # steps region: clone template, patch documented fields
     sr = bytearray(steps_region)
@@ -124,27 +163,39 @@ def build_track_block(template, *, gate, pitches, steps, division, scale, root,
     sr[SR_SUSTAIN] = sustain
     struct.pack_into("<H", sr, SR_MIDIMASK, mask)
     sr[SR_ROOT] = root
+    sr[SR_CYCLES] = cycles
+    sr[SR_STEPGROUP] = step_group
+    # locks live in the base track OR any per-cycle record; both set the lock-summary/terminator.
+    cyc_locks = any(g or p for _, _, g, p in cycle_records)
+    has_locks = bool(pitch_locks or groove_locks or cyc_locks)
+    # Position end-marker (device drops a track whose value is wrong): `end_mark` = i+1 for every
+    # track except the pattern's last (1). It lives at steps+0x2b5 on a NON-lock block (2b6=0) and
+    # at steps+0x2b6 on a LOCK block (2b5=0) — set it for BOTH kinds (the non-lock case was the
+    # bug that dropped every position-2+ non-lock track). Self-templated rebuilds pass the block's
+    # own extracted value, so this stays byte-exact.
+    if has_locks:
+        sr[SR_END_MARK] = 0; sr[SR_END_MARK + 1] = end_mark
+    else:
+        sr[SR_END_MARK] = end_mark; sr[SR_END_MARK + 1] = 0
     # If the block carries locks but the template's steps-region is a NON-lock one (its lock
     # summary is absent), synthesize the trailing lock-summary the device requires; otherwise a
     # lock-bearing block cloned from a non-lock template mis-renders (chords) and drops a later
     # pattern. Skipped when the template already has the summary (e.g. self-templated roundtrip).
-    if (pitch_locks or groove_locks) and sr[SR_LOCK_FLAG] == 0:
+    if has_locks and sr[SR_LOCK_FLAG] == 0:
         locked_steps = set(pitch_locks) | set(groove_locks)
+        for _, _, g, p in cycle_records:
+            locked_steps |= set(g) | set(p)
         sr[SR_LOCK_FLAG] = 1
-        struct.pack_into("<H", sr, SR_LOCK_CURSOR, max(locked_steps))
-        # end-marker at +0x2b6 (Form Y). Its value is position-dependent within the pattern: the
-        # device drops a lock track whose value is wrong. Observed (device banks): first track=1,
-        # otherwise N-i (N tracks, index i) -> e.g. 3-track pattern = [1,2,1], 2-track = [1,1],
-        # 1-track = [1]. Caller passes end_mark; defaults to 1 (first/last/single).
-        sr[SR_END_MARK] = 0; sr[SR_END_MARK + 1] = end_mark
+        struct.pack_into("<H", sr, SR_LOCK_CURSOR, max(locked_steps) if locked_steps else 0)
     b += sr
-    if pitch_locks or groove_locks:
+    if has_locks:
         b += b"\x00"                               # lock terminator byte (see FORMAT.md)
     return bytes(b)
 
 
 # ── bank (container) synthesis ──────────────────────────────────────────────────────
-def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False):
+def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
+               track_cursors=None):
     """Assemble a per-bank `.t1` from a list of patterns (each a list of track-block bytes).
     Header: 05 "2.1.4" npat 00 tc0 00 00. Patterns separated by 12 B (8 B end-trailer
     `00 00 (tc-1) 00 00 00 00 00` + 4 B next-pattern header `slot tc 00 00`). Bank trailer:
@@ -166,6 +217,13 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False)
     npat = len(patterns)
     if indices is None:
         indices = list(range(npat))
+    # `track_cursors` = the per-pattern saved "current track" cursor (0-based) that goes in each
+    # pattern's end-trailer (offset +2). UI state — the track the device opens that pattern on;
+    # CAN exceed the serialized track count (e.g. cursor parked on an empty track). Defaults to
+    # the last serialized track. (This byte was historically read as `prev_tc-1`; that held only
+    # because the cursor sat on the last track. See FORMAT.md.)
+    if track_cursors is None:
+        track_cursors = [len(p) - 1 for p in patterns]
     cur = max(0, min(current_pattern, 15))
     if final_has_locks:                         # patch the bank's final lock terminator
         fb = bytearray(patterns[-1][-1])        # build_track_block left a 0x00 terminator here
@@ -186,12 +244,10 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False)
     out += bytes([npat, 0, len(patterns[0]), 0, 0])
     out += b"".join(patterns[0])
     for i in range(1, npat):
-        prev_tc = len(patterns[i - 1])
-        out += bytes([0, 0, prev_tc - 1, 0, 0, 0, 0, 0])        # end-of-prev-pattern trailer
+        out += bytes([0, 0, track_cursors[i - 1], 0, 0, 0, 0, 0])  # end-of-prev-pattern trailer
         out += bytes([indices[i], len(patterns[i]), 0, 0])      # next-pattern header (slot, tc)
         out += b"".join(patterns[i])
-    last_tc = len(patterns[-1])
-    out += bytes([0, 0, last_tc - 1, 0, 0, 0, 0, 0])            # end-of-last-pattern trailer
+    out += bytes([0, 0, track_cursors[-1], 0, 0, 0, 0, 0])      # end-of-last-pattern trailer
     out += bytes([0x78, 0, 0, 0, 0, cur, cur, 1, 0, 0, 0, cur])  # bank summary
     out += b"os|t"
     return bytes(out)
@@ -362,7 +418,11 @@ def midi_to_pattern(path, template, div, length):
     blocks = []
     last_has_locks = False
     for i, fields in enumerate(track_fields):
-        end_mark = 1 if i == 0 else n - i
+        # lock-block end-marker (steps+0x2b6): i+1 for every track except the pattern's LAST,
+        # which is 1 (Form Y) — device-confirmed across iter9/10 (N up to 12). (The earlier
+        # `N-i` rule only coincided for N<=3, all the prior hwtest patterns had.) The bank's
+        # final block may instead be Form X (marker 0) — build_bank handles that.
+        end_mark = 1 if i == n - 1 else i + 1
         last_has_locks = bool(fields["pitch_locks"] or fields["groove_locks"])
         blocks.append(build_track_block(template, end_mark=end_mark, **fields))
     return blocks, last_has_locks

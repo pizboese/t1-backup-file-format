@@ -164,6 +164,21 @@ Two patterns of chord-lock tracks that exposed the trailing per-block **lock-sum
 `steps+0x29c` and the load rules deciding whether a lock track loads. This decode made
 from-scratch chord import work on hardware. See `14_lock_summary/README.md`.
 
+## 15_steps64_cycles/ — decode step counts 1-64 + the Cycles feature
+One bank, 2 patterns. P1: 8 tracks sweeping **steps 16/32/48/64** + the step-group page
+selector. P2: 12 tracks exercising **cycles** (count 1-16, plus per-cycle edits of pitch /
+sustain / steps-length / gate / per-step locks, on single and multiple cycles). Decoded the
+64-byte gate, cycle count (`steps+0x14d`), step-group page (`steps+0x2b0`), per-cycle pitch
+overrides (header), and per-cycle step-sequence records (lock region). `0.t1` rebuilds
+byte-for-byte. (Was `iteration9.zip`.) See FORMAT.md "STEPS up to 64 + CYCLES".
+
+## 16_cycle_paramsweep_cursor/ — per-cycle param-id table + saved cursor
+`0.t1`: a dual sweep that nailed the per-cycle **track-param override** format — P1 sweeps the
+edited cycle (cycle-index byte), P2 sweeps the parameter (id table: `00`=steps `04`=division
+`06`=scale `0a`=vel `0e`=sustain `22`=root; value u16 LE, proven by division=384). `1.t1`/`2.t1`:
+two otherwise-identical 2-pattern banks differing only in the selected pattern — proved the saved
+**pattern cursor** lives solely in the 12-B bank summary. (Was `iteration10.zip`.)
+
 ## device_settings/
 `Settings.json` and `Wifi.json` as found in a backup — global device configuration
 (MIDI routing, clock, CV, etc.), not part of the per-bank pattern data.
