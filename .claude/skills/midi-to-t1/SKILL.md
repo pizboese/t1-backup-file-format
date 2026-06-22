@@ -52,12 +52,13 @@ Then settle the per-track shape (recommendations):
 Ask TWO things: (a) **fresh single-bank file** or **based on an existing backup**, and (b) **which
 bank (0–7)** to target.
 
-- **Fresh file:** `--new-backup --slot N` → a minimal zip with just `./` + `./N.t1` (no other banks,
-  no settings — the device's project-export shape). Hardware-confirmed to restore on the T-1.
-- **Based on existing:** `--zip THEIR_BACKUP.zip --slot N` (banks ≠N + settings stay byte-identical;
-  non-destructive, hardware-proven — restoring overwrites all 8 banks but the others are preserved
-  as-is). Ask the user to export a backup (Backup menu) and share it; or use
-  `hwtest/fromT1/original_backup.zip` as a splice base for a quick test.
+- **Fresh file (preferred):** `--new-backup --slot N` → a minimal zip with just `./` + `./N.t1` (no
+  other banks, no settings — the device's project-export shape). Hardware-confirmed: restoring it
+  overwrites **only bank N** and leaves the other 7 banks on the device intact — the truly
+  non-destructive path, no real backup needed.
+- **Based on existing:** `--zip THEIR_BACKUP.zip --slot N` (banks ≠N + settings stay byte-identical).
+  Only needed if you specifically want a full 8-bank backup; otherwise prefer the fresh file. Ask the
+  user to export a backup (Backup menu), or use `hwtest/fromT1/original_backup.zip` as a splice base.
 
 ```bash
 # simple / interview or filename:

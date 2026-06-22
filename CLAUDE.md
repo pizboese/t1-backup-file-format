@@ -111,6 +111,9 @@ Two zip layouts the device uses (all entries `./`-prefixed, **ZIP_STORED**/uncom
   device's own project-export shape (e.g. `hwtest/fromT1/base_locks_cycles.zip` = `0.t1` + Wifi).
   ✅ **The device restores this** — `--new-backup` output (`./` + `./0.t1` only) loaded & rendered
   correctly on hardware (2026-06-22), so a single-bank file does NOT need the other banks/settings.
+  ✅ **Restoring a single-bank file overwrites ONLY that bank** — the device keeps the other 7 banks
+  intact (hardware-confirmed). So this is the truly **non-destructive** path: rewrite just the bank
+  you need and leave everything else on the device as-is — no splicing a real backup required.
 
 **✅ Folded into the importer** — no manual zipping needed:
 - `--zip REAL_BACKUP.zip --slot N` → emits `OUT.zip` by splicing into a real backup (proven path).
