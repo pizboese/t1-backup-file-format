@@ -53,8 +53,7 @@ Ask TWO things: (a) **fresh single-bank file** or **based on an existing backup*
 bank (0–7)** to target.
 
 - **Fresh file:** `--new-backup --slot N` → a minimal zip with just `./` + `./N.t1` (no other banks,
-  no settings — the device's project-export shape). ⚠️ Whether the device *restores* a single-bank
-  file is still being hardware-confirmed — note this to the user.
+  no settings — the device's project-export shape). Hardware-confirmed to restore on the T-1.
 - **Based on existing:** `--zip THEIR_BACKUP.zip --slot N` (banks ≠N + settings stay byte-identical;
   non-destructive, hardware-proven — restoring overwrites all 8 banks but the others are preserved
   as-is). Ask the user to export a backup (Backup menu) and share it; or use

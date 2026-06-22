@@ -29,7 +29,9 @@ Reverse-engineering the Torso T-1 sequencer's backup format to import/export pat
   byte-for-byte. **Sustain** now uses the real **log law** (byte 64 = one division; length doubles
   every 16 byte units — hardware-confirmed) and **velocity** is 1:1 (see "Device value scale"). The
   backup-zip builder is folded in (`--zip`/`--new-backup`/`--slot`); a guided **skill**
-  (`.claude/skills/midi-to-t1`) runs the interview→convert→verify. See FORMAT.md.
+  (`.claude/skills/midi-to-t1`) runs the interview→convert→verify. The full converter output —
+  `--cycles bars` natural encoding + corrected sustain in a `--new-backup` **fresh single-bank file**
+  — **loaded & rendered correctly on device** (2026-06-22). See FORMAT.md.
 - **Fixes / choices made during hardware verification:**
   1. **Final-block lock terminator** (CONFIRMED format rule, invisible to parser/roundtrip — no
      sample exercised it): the bank's last block, if it carries locks, uses a terminator byte =
@@ -107,7 +109,8 @@ Two zip layouts the device uses (all entries `./`-prefixed, **ZIP_STORED**/uncom
   exports (replace one slot's `.t1`; banks ≠slot + settings stay **byte-identical**).
 - **Fresh single-bank file** — just `./` + `./<slot>.t1` (no other banks, no settings). This is the
   device's own project-export shape (e.g. `hwtest/fromT1/base_locks_cycles.zip` = `0.t1` + Wifi).
-  ⚠️ Whether the device *restores* a single-bank file (vs only exports one) is being hardware-tested.
+  ✅ **The device restores this** — `--new-backup` output (`./` + `./0.t1` only) loaded & rendered
+  correctly on hardware (2026-06-22), so a single-bank file does NOT need the other banks/settings.
 
 **✅ Folded into the importer** — no manual zipping needed:
 - `--zip REAL_BACKUP.zip --slot N` → emits `OUT.zip` by splicing into a real backup (proven path).
