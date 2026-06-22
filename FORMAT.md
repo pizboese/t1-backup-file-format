@@ -327,10 +327,17 @@ per-cycle record carries per-step locks.
 
 ### Open / needs another targeted backup
 - ~~param-id table for per-cycle track-param overrides~~ — **DONE** (iteration10, table above).
-- The 2-byte tail after the last per-cycle record / interaction with the existing end-marker &
-  final-block Form-X/Y rules when cycle records are present in the bank's last block.
-- Importer/exporter support: the exporter can now *read* steps-64 + cycles; **synthesis**
-  (MIDI→.t1) of cycles is not implemented (would need MIDI conventions for per-cycle variation).
+- ~~base track per-step locks AND cycle records coexisting (the device's natural compact cycle
+  encoding: base = cycle 0 with its locks, records only for differing cycles)~~ — **DONE**, device-
+  authored `samples/17_base_locks_cycles` (3 tracks: base pitch-locks+record, base groove-locks+
+  record, base chords+2 records incl. a track-pitch-only cycle). Rebuilds **byte-for-byte**; decoder
+  reads it and `build_track_block` emits it. Also re-confirmed **velocity = N×8** (vel 16 = 2/16 LED)
+  and **sustain min=0 / max=127**. `build_cycle_track` now uses this natural encoding.
+- ~~The 2-byte tail / end-marker & final-block Form-X/Y rules when cycle records are in the bank's
+  last block~~ — exercised by the hardware-verified `make_2mid_cycles` import (final block carried
+  cycle records, `final_has_locks=True`, loaded correctly) and the byte-exact `samples/17` rebuild.
+- ~~Importer synthesis of cycles (MIDI→.t1)~~ — **DONE**: `midi_to_t1.py --cycles bars` maps each
+  voice's consecutive `--steps`-long windows to cycles (window k → cycle k). See `build_cycle_track`.
 
 ### Saved pattern cursor — CONFIRMED ISOLATED (`iteration10` banks 1 & 2)
 The "which pattern was selected when the backup was saved" cursor is the 0-based pattern **slot**,

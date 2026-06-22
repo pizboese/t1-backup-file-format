@@ -130,7 +130,11 @@ def parse_track(data, run, block_hi=None):
     # Per-cycle step-sequence records (FORMAT.md) live between the base lock lists and `steps`,
     # shifting `steps` later. Detect them (num_edited_cycles byte) and, when present, relocate
     # `steps` via the Zone-B `53` terminator (steps+0x295) which is cycle/lock-independent.
-    num_edited_cycles = data[run + OFF_LOCKS + 1 + 1]   # after groove_count + pitch_count
+    # num_edited_cycles sits immediately AFTER the (variable-length) base lock lists — i.e. at
+    # the position _parse_locks walked to before adding the 18-byte pad (so - PAD_AFTER_LOCKS).
+    # Reading it at a fixed run+0x4e offset only works when the base track is lock-free; a base
+    # block that itself carries locks would misread a mid-list byte. (so is relocated below.)
+    num_edited_cycles = data[so - PAD_AFTER_LOCKS]
     has_cycle_records = num_edited_cycles > 0 or bool(pitch_overrides)
     if has_cycle_records and block_hi is not None:
         term = _last_zoneB_term(data, run, block_hi)

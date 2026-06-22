@@ -15,12 +15,21 @@ Reverse-engineering the Torso T-1 sequencer's backup format to import/export pat
   Handles pulses, loop length, per-track timing/division, track pitch + chords, per-step
   pitch locks (incl. chords), velocity + per-step locks, sustain + per-step locks,
   multi-channel routing, root, scale.
-- **`MIDI → .t1` importer: WORKING, hardware-verified — INCLUDING CHORDS** (multi-note pitch
-  locks render as block chords on device, from a synthesized non-lock template — no per-track
+- **`MIDI → .t1` importer: WORKING, hardware-verified — INCLUDING CHORDS & CYCLES** (multi-note
+  pitch locks render as block chords on device, from a synthesized non-lock template — no per-track
   device-template cloning needed). Covers: bank loading, channel routing, gates, single-note +
-  chord pitch locks, velocity, sustain, multi-pattern containers. Proven by `test_roundtrip.py`
-  (**all sample banks rebuild byte-for-byte**) **and on real hardware** (`hwtest/project_locksummary.zip`
-  loaded & rendered correctly: 2 patterns × {single-note, scale, chords, velocity-ramp, sustain}).
+  chord pitch locks, velocity, sustain, multi-pattern containers, and **cycles** (`--cycles bars`,
+  bars→cycles). Proven by `test_roundtrip.py` (**all sample banks rebuild byte-for-byte**) **and on
+  real hardware** (`hwtest/project_locksummary.zip`: chords/velocity/sustain; the bars→cycles import
+  also loaded & stepped through correctly on device).
+- **Cycles import + sustain (2026-06-22):** `midi_to_t1.py --cycles bars` maps each voice's
+  consecutive `--steps`-windows to cycles using the device's **natural encoding** (base = cycle 0
+  with its locks; a per-cycle record only when a cycle differs). Verified both directions — a
+  device-authored base-locks+cycle-records bank (`samples/17_base_locks_cycles`) rebuilds
+  byte-for-byte. **Sustain** now uses the real **log law** (byte 64 = one division; length doubles
+  every 16 byte units — hardware-confirmed) and **velocity** is 1:1 (see "Device value scale"). The
+  backup-zip builder is folded in (`--zip`/`--new-backup`/`--slot`); a guided **skill**
+  (`.claude/skills/midi-to-t1`) runs the interview→convert→verify. See FORMAT.md.
 - **Fixes / choices made during hardware verification:**
   1. **Final-block lock terminator** (CONFIRMED format rule, invisible to parser/roundtrip — no
      sample exercised it): the bank's last block, if it carries locks, uses a terminator byte =
@@ -63,12 +72,14 @@ was the trailing lock-summary + load rules (resolved; see FORMAT.md).
 - `t1_to_midi.py` — exporter. `python3 t1_to_midi.py FILE.t1 -o OUTDIR [--bpm 120]`
   writes one `.mid` per non-empty pattern (Type 1; 96 PPQN to match the device).
 - `midi_to_t1.py` — importer. `python3 midi_to_t1.py -o OUT.t1 IN1.mid [IN2.mid …]`
-  `[--div 16] [--length N] [--template FILE]`. Each `.mid` → one pattern; each MIDI channel
-  with notes → one track; chords/pitch-changes → pitch locks; per-step velocity/length →
-  groove locks. Scale/root default Chromatic/C (absolute pitch plays exactly). **Imports a
-  single 16-step base cycle only — it does NOT yet emit cycles or steps>16 from MIDI** (the
-  *synthesis* primitives exist; only the MIDI→cycle mapping is missing — see "Cycles in MIDI
-  import" under Next steps).
+  `[--div 16] [--length N] [--split-tracks] [--cycles bars] [--steps N] [--cycle-count N]
+  [--zip BACKUP.zip --slot N] [--template FILE]`. Each `.mid` → one pattern; each MIDI channel
+  (or **SMF track** with `--split-tracks`) with notes → one track; chords/pitch-changes → pitch
+  locks; per-step velocity/length → groove locks. **Cycles: DONE** — `--cycles bars` distributes
+  each voice's consecutive `--steps`-long windows across cycles (window k → cycle k, steps 1–64),
+  using the device's natural encoding (base = cycle 0 with its locks; a per-cycle record only when
+  a cycle differs — a repeated bar needs none). `--zip/--slot` emits a device-loadable backup
+  directly (folds in the splice). Scale/root default Chromatic/C (absolute pitch plays exactly).
 - `test_roundtrip.py` — self-test: rebuilds every sample bank byte-for-byte (run after any
   change to the block/container synthesis or the parser). Now includes the multi-pattern/
   lock-last regression (`samples/11_multipattern_locklast/handmade.t1`).
@@ -81,18 +92,28 @@ was the trailing lock-summary + load rules (resolved; see FORMAT.md).
   *synthesis* (the two device cycle banks rebuild byte-for-byte in `test_roundtrip.py`).
 - `make_hwtest_midi.py` — generates the dependency-free test MIDI (`hwtest/p1_routing.mid`,
   `hwtest/p2_dynamics.mid`) used for hardware verification.
+- `make_2mid_cycles.py` — worked one-off: `midi/2.mid` → 2 tracks × 8 cycles (the original
+  all-records cycle encoding; superseded by `midi_to_t1.py --cycles bars` but kept as a record).
+- `.claude/skills/midi-to-t1/` — guided import **skill**: inspect MIDI → recommend mapping (split/
+  cycles/steps, new-vs-existing backup, which bank) → ask → run `midi_to_t1.py` → verify.
 
 Quick check: `python3 t1_to_midi.py samples/09_perstep_polyphony/bank.t1 -o /tmp/out`
 Importer check: `python3 test_roundtrip.py` (expect "ALL PASS")
 
-## Loading on the device (full backup zip — per-bank import is NOT possible)
-The T-1 restores a **full backup zip**, not a single `.t1`. Structure (all entries `./`-prefixed,
-**Stored**/uncompressed): `0.t1`…`7.t1` (one per bank), `Settings.json`, `Wifi.json`. To test a
-synthesized bank **non-destructively**, splice it into a real backup the user exports:
-unzip their backup → replace one slot's `.t1` (we used **slot 0**, the empty bank) → repackage
-with identical layout (use Python `zipfile`, `ZIP_STORED`, exact `./` names). Banks 1–7 +
-settings must stay byte-identical. See `hwtest/` for a working example builder.
-**TODO: fold this into `midi_to_t1.py`** (`--zip BACKUP.zip --slot N` → emit a loadable zip).
+## Loading on the device (backup zip)
+Two zip layouts the device uses (all entries `./`-prefixed, **ZIP_STORED**/uncompressed):
+- **Full backup** — `0.t1`…`7.t1` + `Settings.json` + `Wifi.json`. The Backup-menu restore
+  overwrites all 8 banks, so to test **non-destructively** splice into a real backup the user
+  exports (replace one slot's `.t1`; banks ≠slot + settings stay **byte-identical**).
+- **Fresh single-bank file** — just `./` + `./<slot>.t1` (no other banks, no settings). This is the
+  device's own project-export shape (e.g. `hwtest/fromT1/base_locks_cycles.zip` = `0.t1` + Wifi).
+  ⚠️ Whether the device *restores* a single-bank file (vs only exports one) is being hardware-tested.
+
+**✅ Folded into the importer** — no manual zipping needed:
+- `--zip REAL_BACKUP.zip --slot N` → emits `OUT.zip` by splicing into a real backup (proven path).
+- `--new-backup --slot N` → emits a fresh single-bank `OUT.zip` (`./` + `./N.t1` only).
+`write_backup_zip()` does both. (The standalone splice recipe still lives in `make_cycle_hwtest.py`
+/ `make_2mid_cycles.py` for reference.)
 
 ### How to build the loadable backup zip (recipe)
 Given a synthesized `BANK.t1` and the user's real `ORIG.zip`, replace one slot and repackage:
@@ -162,12 +183,15 @@ settings, so always splice into a real backup — never ship a zip with only you
 5. **Stored-state region is not noise** — it carries a field that governs chord rendering; clone
    it from a *real device* block of a matching track type, not a synthesized one.
 
-### Device value scale (velocity / sustain) — use the N/16 grid
-The device shows/enters these as 16 LED steps; **stored byte ≈ N×8** (e.g. 8/16 → 64, 16/16 →
-127). **Sustain** = note length relative to the track division: ~byte 64 ≈ 50% = **one full
-step**; higher overlaps into the next step; min = shortest. Importer currently stores sustain
-`round(steps×64)-1` (1 step→63) — **TODO: change default to 64** to match the device, and pick
-test velocities/sustains on the N×8 grid so on-device LED readings line up for easy comparison.
+### Device value scale (velocity / sustain)
+The device shows/enters these as 16 LED steps; **stored byte ≈ N×8** (e.g. 8/16 → 64, 16/16 → 127).
+- **Velocity** = base dynamic level, stored byte ↔ MIDI velocity **1:1** (0–127). Already correct
+  in both importer and exporter (no scaling); manual: groove/velocity-probability.
+- **Sustain** = note length relative to the track division. **DONE — implemented the real way**
+  (manual: groove/sustain): byte **64 = 50% = one full division** (device default), so
+  `steps_long = sustain/64` (byte 128≈2 steps → overlaps the next step; min=1=shortest). Importer
+  stores `min(127, round(steps_long×64))`, default **64**; exporter inverts `dur = step_ticks×sus/64`.
+  (Was off-by-one: `round(steps×64)-1`, default 63 — fixed.)
 
 ## `samples/` — archived backups (the experimental record)
 Each folder is one experiment that decoded part of the format; `.t1` files are extracted
@@ -184,29 +208,21 @@ in FORMAT.md. The remaining steps-region work is now optional polish, not a bloc
    - Sweep remaining params (Repeats, Rotate, Phrase, Harmony, Chance…) to expose them as
      importer features, using the manual + monotonic sweeps. (Cycles + Steps are done.)
 
-**Cycles in MIDI import (not started — the only missing piece is the MIDI→cycle MAPPING).**
-The *byte synthesis* is DONE and hardware-verified: `build_track_block` already accepts
-`steps` (1-64), `step_group`, and `cycles`/`cycle_pitch`/`cycle_records`/`cycle_params` (see its
-docstring + FORMAT.md "STEPS up to 64 + CYCLES"). `make_cycle_hwtest.py`'s `track()` helper is a
-**worked, hardware-verified example** of turning a high-level per-cycle spec into those kwargs —
-copy its shape. What's missing is in `map_channel_to_track`/`midi_to_pattern`, which today emit
-only a single 16-step base cycle (`cycles=4`, no per-cycle data). To add cycles you must:
-1. **Decide how a `.mid` expresses cycles** (the real open question — MIDI has no cycle concept).
-   Options: one `.mid`/clip per cycle; a marker-meta convention; or N×length bars where bar *k* =
-   cycle *k*. Then diff each cycle against the base and emit only the deltas.
-2. Translate those deltas to the kwargs, respecting the decoded rules:
-   - cycle indices are **0-based**, stored **descending**; **every edited cycle needs a step-seq
-     record** (gate = base gate if unchanged) even if only its pitch/param changed;
-   - per-cycle **track pitch** → `cycle_pitch` (header); **sustain/steps/division/scale/vel/root**
-     → `cycle_params` (ids in FORMAT.md); **gate + per-step locks** → `cycle_records`;
-   - a per-step lock only sounds if **that cycle's gate has a pulse on that step**;
-   - pass the right `end_mark` (i+1, last track of pattern = 1) — `midi_to_pattern` already does.
-3. Also wire steps>16 and `step_group` through `map_channel_to_track` (currently capped at 16).
+**✓ DONE — Cycles in MIDI import** (`--cycles bars`). `build_cycle_track`/`midi_to_pattern` map
+each voice's consecutive `--steps`-long windows to cycles (window k → cycle k), `--split-tracks`
+maps SMF tracks → T-1 tracks, and `--zip/--slot` emits a loadable backup. Uses the device's
+**natural encoding** (base = cycle 0 with its per-step locks; a per-cycle record only when a cycle
+differs from cycle 0), now **hardware-verified both ways**: `make_2mid_cycles` (all-records form)
+loaded on device, and `samples/17` (a device-authored base-locks+records bank) rebuilds byte-for-
+byte. The interactive "use cycles? how many steps/cycles?" interview lives in a thin **skill**
+(`.claude/skills/midi-to-t1`), NOT in the converter — the converter stays non-interactive/testable.
+Remaining cycle polish (optional): per-cycle **track-param** overrides from MIDI (steps/division/
+scale/root per cycle → `cycle_params`); `cycle_pitch` header overrides; marker-based cycle conventions.
 
-**Priority 2 — importer polish**: velocity/sustain on the N×8 grid + sustain default 64 (see
-above); fold the **backup-zip builder** into `midi_to_t1.py` (`--zip`/`--slot`); scale/root
-mapping (currently Chromatic/C so absolute pitch plays); choose track default pitch to minimise
-locks.
+**Priority 2 — importer polish**: ~~velocity/sustain scale + sustain default~~ **DONE** (velocity
+1:1; sustain uses the real log law, byte 64 = one division — see "Device value scale"). ~~backup-zip
+builder~~ **DONE** (`--zip/--slot`). Remaining: scale/root mapping (currently Chromatic/C so absolute
+pitch plays); choose track default pitch to minimise locks.
 
 **Priority 3 — other unknowns**: track type (Note/CC/FX), mute/enable, "free" (non-fixed)
 division mode, scale-interval tables in the exporter.

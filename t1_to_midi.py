@@ -25,6 +25,13 @@ import t1_format
 TPQN = t1_format.PPQN   # 96, matches the T-1 internal resolution (division in ticks)
 
 
+def _sustain_steps(sus_byte):
+    """Stored sustain byte -> note length in step divisions (device's log law): length
+    DOUBLES every 16 byte units, anchored at byte 64 = one division. Hardware-confirmed
+    (8/16 LED byte 64=1 step, 12/16=96=4, 14/16=112=8, 16/16=127≈16). See midi_to_t1.sustain_byte."""
+    return 2.0 ** ((sus_byte - 64) / 16)
+
+
 def _vlq(n):
     out = bytearray([n & 0x7f])
     n >>= 7
@@ -67,7 +74,9 @@ def build_smf(patterns, bpm):
                     gl = t["groove_locks"].get(s, {})
                     vel = gl.get("velocity", t["velocity"])
                     sus = gl.get("sustain", t["sustain"])
-                    dur = max(1, round(step_ticks * (sus + 1) / 64))
+                    # Sustain -> note length via the device's log law: byte 64 = one division;
+                    # length doubles every 16 byte units (see _sustain_steps / groove/sustain page).
+                    dur = max(1, round(step_ticks * _sustain_steps(sus)))
                     for note in notes:
                         m = _note_to_midi(note)
                         for ch in chans:
