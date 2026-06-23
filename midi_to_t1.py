@@ -26,8 +26,13 @@ Options:
   --length N         loop length in steps (1..16); default 16 (full bar). Single-cycle mode only.
   --split-tracks     map each SMF track (not each MIDI channel) to a T-1 track — so a chords
                      part and a bass part sharing one channel become two tracks.
-  --cycles bars      distribute each voice's consecutive `--steps`-long windows across CYCLES
-                     (window k -> cycle k). Omit for the legacy single-base-cycle behaviour.
+  --drum-split       treat each input as a DRUM part: explode it into one T-1 track per drum
+                     sound (GM map) on fixed slots — kick=16, snare=15, closed-hat=14, open-hat=13,
+                     clap=12, others below; >8 sounds collapse by family. Each single-pitch track
+                     has NO per-step pitch lock. All drum tracks share the source MIDI channel.
+  --cycles MODE      'auto' (DEFAULT): use cycles only for voices that span >1 `--steps` window;
+                     'bars': always distribute each voice's `--steps`-long windows across CYCLES
+                     (window k -> cycle k); 'off' (or --length N): force a single base cycle.
   --steps N          steps per cycle/track, 1..64 (default 16). With `--cycles bars` this is the
                      window length that defines a cycle.
   --cycle-count N    force the cycle count 1..16 (default: auto = number of windows with notes).
@@ -212,12 +217,17 @@ def build_track_block(template, *, gate, pitches, steps, division, scale, root,
     # locks live in the base track OR any per-cycle record; both set the lock-summary/terminator.
     cyc_locks = any(g or p for _, _, g, p in cycle_records)
     has_locks = bool(pitch_locks or groove_locks or cyc_locks)
-    # Position end-marker (device drops a track whose value is wrong): `end_mark` = i+1 for every
-    # track except the pattern's last (1). It lives at steps+0x2b5 on a NON-lock block (2b6=0) and
-    # at steps+0x2b6 on a LOCK block (2b5=0) — set it for BOTH kinds (the non-lock case was the
-    # bug that dropped every position-2+ non-lock track). Self-templated rebuilds pass the block's
-    # own extracted value, so this stays byte-exact.
-    if has_locks:
+    # A block is in "summary" form when it carries locks (or the cloned template already is — a
+    # device-authored summary-but-lockless block, e.g. project.zip's first track; preserved for
+    # byte-exact roundtrip). Summary blocks keep the marker at 0x2b6 + a trailing terminator byte;
+    # plain blocks keep it at 0x2b5.
+    summary = has_locks or sr[SR_LOCK_FLAG] != 0
+    # Position end-marker = (NEXT serialized track's position) - 1; the caller passes this via
+    # `end_mark` (for contiguous tracks it equals i+1). A positional GAP to the next track is
+    # encoded purely by this value — it does NOT force summary form (device-confirmed by
+    # project2.zip: a plain 0x2b5 marker jumps across empty slots). The pattern's last track uses
+    # a small sentinel (caller passes 1). A wrong value drops/mis-slots the track on the device.
+    if summary:
         sr[SR_END_MARK] = 0; sr[SR_END_MARK + 1] = end_mark
     else:
         sr[SR_END_MARK] = end_mark; sr[SR_END_MARK + 1] = 0
@@ -232,14 +242,14 @@ def build_track_block(template, *, gate, pitches, steps, division, scale, root,
         sr[SR_LOCK_FLAG] = 1
         struct.pack_into("<H", sr, SR_LOCK_CURSOR, max(locked_steps) if locked_steps else 0)
     b += sr
-    if has_locks:
-        b += b"\x00"                               # lock terminator byte (see FORMAT.md)
+    if summary:
+        b += b"\x00"                               # summary-block terminator byte (see FORMAT.md)
     return bytes(b)
 
 
 # ── bank (container) synthesis ──────────────────────────────────────────────────────
 def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
-               track_cursors=None):
+               track_cursors=None, first_slots=None):
     """Assemble a per-bank `.t1` from a list of patterns (each a list of track-block bytes).
     Header: 05 "2.1.4" npat 00 tc0 00 00. Patterns separated by 12 B (8 B end-trailer
     `00 00 (tc-1) 00 00 00 00 00` + 4 B next-pattern header `slot tc 00 00`). Bank trailer:
@@ -268,6 +278,11 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
     # because the cursor sat on the last track. See FORMAT.md.)
     if track_cursors is None:
         track_cursors = [len(p) - 1 for p in patterns]
+    # `first_slots` = each pattern's FIRST serialized track's 1-based slot. Stored as slot-1 in
+    # byte 0x09 (pattern 0) and in the 3rd byte of each later pattern's gap header. Defaults to 1
+    # (byte 0) so contiguous-from-slot-1 banks stay byte-identical. See FORMAT.md / project3.zip.
+    if first_slots is None:
+        first_slots = [1] * npat
     cur = max(0, min(current_pattern, 15))
     if final_has_locks:                         # patch the bank's final lock terminator
         fb = bytearray(patterns[-1][-1])        # build_track_block left a 0x00 terminator here
@@ -285,11 +300,11 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
         # Form Y (marker already at the region end-byte): leave terminator 0, no pad.
         patterns[-1][-1] = bytes(fb)
     out = bytearray(b"\x052.1.4")
-    out += bytes([npat, 0, len(patterns[0]), 0, 0])
+    out += bytes([npat, 0, len(patterns[0]), first_slots[0] - 1, 0])
     out += b"".join(patterns[0])
     for i in range(1, npat):
         out += bytes([0, 0, track_cursors[i - 1], 0, 0, 0, 0, 0])  # end-of-prev-pattern trailer
-        out += bytes([indices[i], len(patterns[i]), 0, 0])      # next-pattern header (slot, tc)
+        out += bytes([indices[i], len(patterns[i]), first_slots[i] - 1, 0])  # next-pattern header
         out += b"".join(patterns[i])
     out += bytes([0, 0, track_cursors[-1], 0, 0, 0, 0, 0])      # end-of-last-pattern trailer
     out += bytes([0x78, 0, 0, 0, 0, cur, cur, 1, 0, 0, 0, cur])  # bank summary
@@ -527,8 +542,9 @@ def build_cycle_track(voice_notes, ppqn, div, steps, cycle_count=None):
     device-authored base-locks+records bank, samples/17): base track = cycle 0 WITH its per-step
     pitch (incl. chords) + groove (velocity/sustain) locks; a per-cycle step-seq record is emitted
     ONLY for cycles whose content differs from cycle 0 (an identical cycle just replays the base —
-    e.g. a repeated bar needs no record). Every active step is pitch-locked so the single-note
-    default never sounds (avoids the partial-lock drop rule)."""
+    e.g. a repeated bar needs no record). Pitch locks are emitted only when a step's note differs
+    from the track default (a single-pitch drum track gets NONE — fewest edited steps); when any
+    differ, ALL active steps are locked (the single-note-default partial-lock drop rule)."""
     grid = max(1, ppqn * 4 // div)
     window = steps * grid
     buckets = {}
@@ -550,13 +566,20 @@ def build_cycle_track(voice_notes, ppqn, div, steps, cycle_count=None):
         default_pitch = _most_common([min(st["notes"]) for st in cells], 60)
     default_vel = _most_common([st["vel"] for st in cells], 100)
     default_sus = _most_common([st["sus"] for st in cells], SUSTAIN_DEFAULT)
+    # Pitch-lock steps only when needed: if EVERY active step already plays the single default
+    # pitch (the usual case for a split drum track), lock NOTHING — the gate alone plays it, so no
+    # step shows as "edited". If ANY step differs (a chord or a pitch change), lock ALL active
+    # steps (the single-note-default partial-lock drop rule — FORMAT.md). Groove (velocity/sustain)
+    # locks are likewise only emitted where the value differs from the track default.
+    needs_pitch = any(st["notes"] != [default_pitch] for st in cells)
 
     def to_cycle(q):
         gate = [0] * GATE_LEN
         pitch_locks, groove_locks = {}, {}
         for step, st in q.items():
             gate[step] = 1
-            pitch_locks[step] = st["notes"]          # lock every active step (covers chords)
+            if needs_pitch:
+                pitch_locks[step] = st["notes"]      # lock all active steps (covers chords)
             gl = {}
             if st["vel"] != default_vel:
                 gl[PARAM_VELOCITY] = st["vel"]
@@ -595,11 +618,23 @@ def _voices(path, split):
                   for ch in sorted(by_chan)]
 
 
+def _is_multibar(notes, ppqn, div, steps):
+    """True if the voice spans more than one `steps`-long window (i.e. has content past the first
+    cycle) — used by `cycles_mode='auto'` to decide whether cycles are worth enabling."""
+    grid = max(1, ppqn * 4 // div)
+    window = steps * grid
+    return any(nt[0] >= window for nt in notes)
+
+
 def _voice_to_kwargs(notes, ppqn, div, length, cycles_mode, steps, cycle_count, channel=None):
     """One voice's notes (with per-note channel) -> build_track_block kwargs (incl. mask), or
-    None if no notes land on the grid. `channel` forces the output MIDI channel (else inferred)."""
+    None if no notes land on the grid. `channel` forces the output MIDI channel (else inferred).
+    `cycles_mode='auto'` resolves per-voice to 'bars' when the source is multi-bar, else single."""
     chan = channel or (_most_common([nt[4] for nt in notes], 1) if notes else 1)
-    if cycles_mode == "bars":
+    mode = cycles_mode
+    if mode == "auto":
+        mode = "bars" if _is_multibar(notes, ppqn, div, steps) else None
+    if mode == "bars":
         kw = build_cycle_track(notes, ppqn, div, steps, cycle_count)
     else:
         kw = map_channel_to_track([nt[:4] for nt in notes], ppqn, div, length)
@@ -609,14 +644,106 @@ def _voice_to_kwargs(notes, ppqn, div, length, cycles_mode, steps, cycle_count, 
     return kw
 
 
-def _blocks_from_kwargs(template, kwargs_list):
+# ── GM drum map + drum-track splitting ────────────────────────────────────────────────
+# General-MIDI / Ableton drum allocation. A drum part (one MIDI channel, many pitches) is split
+# into ONE T-1 track per drum sound so each is mutable/soloable live AND plays a single constant
+# pitch (no per-step pitch locks — kick fires its note on every active step). The 5 PRIORITY drums
+# get fixed track slots (live-performance anchors); other drums fill the slots just below. Drums
+# occupy slots 9..16 (hard cap 8 tracks); melodic parts live on slots 1..8.
+DRUM_PRIORITY_SLOT = {36: 16, 38: 15, 42: 14, 46: 13, 39: 12}  # kick/snare/closedHat/openHat/clap
+DRUM_MAX_TRACKS = 8
+# non-priority fill order: just under the priority block (11,10,9), then any empty priority slot.
+_NONPRIORITY_SLOTS = [11, 10, 9, 12, 13, 14, 15, 16]
+GM_DRUM_NAMES = {35: "Kick", 36: "Kick", 37: "Rim", 38: "Snare", 39: "Clap", 40: "Snare",
+                 41: "Tom", 42: "ClosedHat", 43: "Tom", 44: "PedalHat", 45: "Tom", 46: "OpenHat",
+                 47: "Tom", 48: "Tom", 49: "Crash", 50: "Tom", 51: "Ride", 52: "Cymbal",
+                 53: "Cymbal", 54: "Tambourine", 55: "Cymbal", 56: "Cowbell", 57: "Crash",
+                 59: "Ride"}
+_DRUM_FAMILY = {**{n: "tom" for n in (41, 43, 45, 47, 48, 50)},
+                **{n: "cymbal" for n in (49, 51, 52, 53, 55, 57, 59)}}
+
+
+def gm_drum_name(note):
+    """Human-readable GM drum name for a MIDI note (used by the skill's report)."""
+    return GM_DRUM_NAMES.get(note, f"Perc{note}")
+
+
+def _drum_family(note):
+    return _DRUM_FAMILY.get(note, "perc")
+
+
+def _group_by_family(pitches):
+    """Group non-priority drum pitches by GM family (toms / cymbals / other perc), for overflow
+    collapse. Returns a list of pitch-lists, ordered toms, cymbals, then perc."""
+    by = {}
+    for p in pitches:
+        by.setdefault(_drum_family(p), []).append(p)
+    order = {"tom": 0, "cymbal": 1, "perc": 2}
+    return [sorted(by[k]) for k in sorted(by, key=lambda k: order.get(k, 9))]
+
+
+def assign_drum_slots(pitches, max_tracks=DRUM_MAX_TRACKS):
+    """Map the distinct drum pitches present onto T-1 track slots. Returns {slot: [pitches]}.
+
+    Priority drums (kick 36 / snare 38 / closed-hat 42 / open-hat 46 / clap 39) take fixed slots
+    16/15/14/13/12. <= max_tracks distinct pitches -> one slot per pitch (single-pitch tracks need
+    NO pitch lock); non-priority drums fill 11,10,9 then any empty priority slot. MORE than
+    max_tracks -> the non-priority drums collapse by GM family into the remaining slots (those
+    collapsed tracks carry per-step pitch locks). Hard cap = max_tracks slots (9..16)."""
+    pitches = sorted(set(pitches))
+    assigned = {DRUM_PRIORITY_SLOT[p]: [p] for p in pitches if p in DRUM_PRIORITY_SLOT}
+    rest = [p for p in pitches if p not in DRUM_PRIORITY_SLOT]
+    free = [s for s in _NONPRIORITY_SLOTS if s not in assigned][:max_tracks - len(assigned)]
+    if len(rest) <= len(free):
+        for p, slot in zip(rest, free):                # each remaining pitch -> its own slot
+            assigned[slot] = [p]
+    else:                                              # overflow: collapse by family
+        groups = _group_by_family(rest)
+        if len(groups) > len(free):                    # merge tail families into the last slot
+            groups = groups[:len(free) - 1] + [sorted(sum(groups[len(free) - 1:], []))]
+        for g, slot in zip(groups, free):
+            assigned[slot] = g
+    return assigned
+
+
+def drum_split_entries(notes, ppqn, div, length, cycles_mode, steps, cycle_count, *,
+                       channel, max_tracks=DRUM_MAX_TRACKS):
+    """Expand one drum voice into [(slot, build kwargs), ...] — one entry per drum track, placed at
+    its assigned slot, all sharing `channel`. Single-pitch tracks come out lock-free.
+
+    Cycles are resolved ONCE for the whole kit (multi-bar -> 'bars') and a UNIFORM cycle count is
+    forced on every split track, so a drum that only plays in bar 1 stays phase-locked with the
+    rest (it just goes silent in the later cycles) instead of looping on its own shorter cycle."""
+    if cycles_mode == "auto":
+        cycles_mode = "bars" if _is_multibar(notes, ppqn, div, steps) else None
+    if cycles_mode == "bars" and cycle_count is None:    # kit-wide bar count keeps tracks in phase
+        grid = max(1, ppqn * 4 // div)
+        window = steps * grid
+        cycle_count = min(16, max((nt[0] // window for nt in notes), default=0) + 1)
+    assigned = assign_drum_slots({n[2] for n in notes}, max_tracks)
+    entries = []
+    for slot, pset in sorted(assigned.items()):
+        ps = set(pset)
+        sub = [n for n in notes if n[2] in ps]
+        kw = _voice_to_kwargs(sub, ppqn, div, length, cycles_mode, steps, cycle_count,
+                              channel=channel)
+        if kw is not None:
+            entries.append((slot, kw))
+    return entries
+
+
+def _blocks_from_kwargs(template, kwargs_list, positions=None):
     """Build a pattern's track blocks from per-track kwargs, assigning the position-dependent
-    end-marker. Returns (blocks, last_block_has_locks)."""
+    end-marker. `positions` = each track's absolute 1-based slot (ascending; e.g. [1,9,16] for a
+    sparse layout). The end-marker on each block = (NEXT track's position) - 1, so empty slots
+    between tracks are skipped; the LAST track uses 1. Defaults to contiguous 1..n (i+1), which
+    keeps existing output byte-identical. Returns (blocks, last_block_has_locks)."""
     n = len(kwargs_list)
+    if positions is None:
+        positions = list(range(1, n + 1))
     blocks, last_has_locks = [], False
     for i, kw in enumerate(kwargs_list):
-        # lock-block end-marker (steps+0x2b6): i+1 for every track except the pattern's LAST (1).
-        end_mark = 1 if i == n - 1 else i + 1
+        end_mark = 1 if i == n - 1 else positions[i + 1] - 1
         last_has_locks = bool(kw["pitch_locks"] or kw["groove_locks"]
                               or any(g or p for _, _, g, p in kw.get("cycle_records", [])))
         blocks.append(build_track_block(template, end_mark=end_mark, **kw))
@@ -687,11 +814,15 @@ def write_backup_zip(bank_bytes, out_zip, slot=0, src_zip=None):
 # A plan is a dict:
 #   {"backup": "new"|"<real_backup.zip>", "bank": 0..7, "div": 16,
 #    "patterns": [ {"slot": 0..15, "tracks": [ TRACKSPEC, ... ]}, ... ]}
-# TRACKSPEC = {"midi": path, "track": 1.., (one source selector:) "smf_track": idx | "name": str |
-#   "channel": 1..16, (per-track opts, all optional:) "cycles": "bars", "steps": 1..64,
-#   "cycle_count": 1..16, "div": N, "length": 1..16, "out_channel": 1..16}
+# TRACKSPEC = {"midi": path, "track": 1..16 (ABSOLUTE slot; empty slots between are skipped),
+#   (one source selector:) "smf_track": idx | "name": str | "channel": 1..16, "pitches": [..]
+#   (keep only these notes), (per-track opts, all optional:) "cycles": "bars", "steps": 1..64,
+#   "cycle_count": 1..16, "div": N, "length": 1..16, "out_channel": 1..16,
+#   "drum_split": true (explode this drum voice into one fixed-slot track per drum sound — ignores
+#   `track`; see assign_drum_slots), "max_drum_tracks": 1..8}
 # Front-ends below build this dict; run_plan() turns it into bank bytes. The FIRST serialized
-# pattern is device slot 0 (container limitation); higher `slot`s may be sparse.
+# pattern is device slot 0 (container limitation); higher `slot`s may be sparse. `track` is the
+# absolute 1-based track slot — drums on high slots + melodic on 1.. coexist via skipped slots.
 
 def _select_voice(smf_tracks, spec):
     """smf_tracks = [(name, notes), ...] from read_midi_tracks. Pick this track's source notes by
@@ -704,36 +835,65 @@ def _select_voice(smf_tracks, spec):
                 return notes
         raise ValueError(f"no SMF track name matches {spec['name']!r} in plan")
     if spec.get("channel") is not None:
-        return [n for _, notes in smf_tracks for n in notes if n[4] == spec["channel"]]
-    return [n for _, notes in smf_tracks for n in notes]
+        notes = [n for _, notes in smf_tracks for n in notes if n[4] == spec["channel"]]
+    else:
+        notes = [n for _, notes in smf_tracks for n in notes]
+    if spec.get("pitches") is not None:               # keep only the listed pitches (drum split)
+        keep = set(spec["pitches"])
+        notes = [n for n in notes if n[2] in keep]
+    return notes
 
 
 def run_plan(plan, template):
     """Assemble bank bytes from a placement plan. Returns (bank_bytes, bank_slot, backup_src)
-    where backup_src is None for a from-scratch backup or a path to splice into."""
+    where backup_src is None for a from-scratch backup or a path to splice into.
+
+    A trackspec's `track` field is the absolute 1-based slot (1..16); empty slots between tracks
+    are skipped (the first track's slot goes in the header, later ones via each block's end-marker
+    = next_slot - 1). So melodic parts can sit on slots 1..k while drums occupy the high slots."""
     div_default = plan.get("div", 16)
     cache = {}
     def voices_of(path):
         if path not in cache:
             cache[path] = read_midi_tracks(path)
         return cache[path]
-    patterns_blocks, indices = [], []
+    patterns_blocks, indices, pattern_cursors, first_slots = [], [], [], []
     final_has_locks = False
     for pat in sorted(plan["patterns"], key=lambda p: p.get("slot", 0)):
-        kwargs_list = []
-        for ts in sorted(pat["tracks"], key=lambda t: t.get("track", 0)):
+        entries = []                                   # (absolute_position, build kwargs)
+        for auto, ts in enumerate(sorted(pat["tracks"], key=lambda t: t.get("track", 0)), 1):
             ppqn, smf = voices_of(ts["midi"])
             notes = _select_voice(smf, ts)
-            kw = _voice_to_kwargs(notes, ppqn, ts.get("div", div_default), ts.get("length"),
-                                  ts.get("cycles"), ts.get("steps", 16), ts.get("cycle_count"),
+            div = ts.get("div", div_default)
+            if ts.get("drum_split"):                   # one drum voice -> many slot-fixed tracks
+                chan = ts.get("out_channel") or (_most_common([n[4] for n in notes], 1)
+                                                  if notes else 1)
+                # drum loops are usually multi-bar -> auto-enable cycles unless told otherwise
+                dcyc = ts["cycles"] if ts.get("cycles") else "auto"
+                entries += drum_split_entries(
+                    notes, ppqn, div, ts.get("length"), dcyc, ts.get("steps", 16),
+                    ts.get("cycle_count"), channel=chan,
+                    max_tracks=ts.get("max_drum_tracks", DRUM_MAX_TRACKS))
+                continue
+            kw = _voice_to_kwargs(notes, ppqn, div, ts.get("length"), ts.get("cycles"),
+                                  ts.get("steps", 16), ts.get("cycle_count"),
                                   channel=ts.get("out_channel"))
             if kw is not None:
-                kwargs_list.append(kw)
-        if not kwargs_list:
+                entries.append((ts.get("track", auto), kw))
+        if not entries:
             continue
-        blocks, last = _blocks_from_kwargs(template, kwargs_list)
+        entries.sort(key=lambda e: e[0])
+        positions = [p for p, _ in entries]
+        kwargs_list = [kw for _, kw in entries]
+        if len(set(positions)) != len(positions):
+            raise ValueError(f"two tracks share a slot in pattern: {sorted(positions)}")
+        if len(positions) > 16 or positions[-1] > 16:
+            raise ValueError(f"pattern needs slot {positions[-1]} / {len(positions)} tracks (max 16)")
+        blocks, last = _blocks_from_kwargs(template, kwargs_list, positions)
         patterns_blocks.append(blocks)
         indices.append(pat.get("slot", len(patterns_blocks) - 1))
+        pattern_cursors.append(positions[-1] - 1)      # saved cursor = highest track (0-based)
+        first_slots.append(positions[0])               # first serialized track's slot (header)
         final_has_locks = last
     if not patterns_blocks:
         raise ValueError("plan produced no patterns (no notes on grid?)")
@@ -741,7 +901,8 @@ def run_plan(plan, template):
         print(f"  note: first serialized pattern is device slot 0 (requested {indices[0]}); "
               "lower slots can't be left empty by the container")
         indices[0] = 0
-    bank = build_bank(patterns_blocks, indices=indices, final_has_locks=final_has_locks)
+    bank = build_bank(patterns_blocks, indices=indices, final_has_locks=final_has_locks,
+                      track_cursors=pattern_cursors, first_slots=first_slots)
     backup = plan.get("backup", "new")
     return bank, plan.get("bank", 0), (None if backup in (None, "new") else backup)
 
@@ -770,9 +931,11 @@ def plan_from_filenames(inputs, *, bank, backup, cycles_mode, steps, cycle_count
     return {"backup": backup, "bank": bank, "div": div, "patterns": patterns}
 
 
-def plan_per_file(inputs, *, bank, backup, split, cycles_mode, steps, cycle_count, div, length):
+def plan_per_file(inputs, *, bank, backup, split, cycles_mode, steps, cycle_count, div, length,
+                  drum_split=False):
     """Default front-end: each input `.mid` -> one pattern (contiguous slots from 0); within it,
-    each SMF track (split) or MIDI channel -> one track."""
+    each SMF track (split) or MIDI channel -> one track. `drum_split` marks every voice as a drum
+    part to be exploded into per-drum tracks on fixed slots (kick 16 ... clap 12, others below)."""
     patterns = []
     for i, path in enumerate(inputs):
         _ppqn, voices = _voices(path, split)
@@ -783,6 +946,7 @@ def plan_per_file(inputs, *, bank, backup, split, cycles_mode, steps, cycle_coun
                 "midi": path, "track": vi + 1,
                 "smf_track": vi if split else None,
                 "channel": None if split else chan,
+                "drum_split": drum_split,
                 "cycles": cycles_mode, "steps": steps, "cycle_count": cycle_count,
                 "div": div, "length": length})
         patterns.append({"slot": i, "tracks": tracks})
@@ -797,12 +961,13 @@ def main(argv):
     length = None
     template_path = DEFAULT_TEMPLATE
     split = False
-    cycles_mode = None          # None (single base cycle) | 'bars'
+    cycles_mode = "auto"        # 'auto' (cycles iff multi-bar) | 'bars' | None (force single)
     steps = 16
     cycle_count = None          # None = auto (one cycle per window with notes)
     zip_src = None
     new_backup = False
     by_filename = False
+    drum_split = False
     plan_path = None
     slot = 0
     inputs = []
@@ -820,7 +985,10 @@ def main(argv):
         elif a == "--split-tracks":
             split = True; i += 1
         elif a == "--cycles":
-            cycles_mode = args[i + 1]; i += 2
+            cycles_mode = args[i + 1]
+            if cycles_mode in ("off", "none"):
+                cycles_mode = None
+            i += 2
         elif a == "--steps":
             steps = int(args[i + 1]); i += 2
         elif a == "--cycle-count":
@@ -831,6 +999,8 @@ def main(argv):
             new_backup = True; i += 1
         elif a == "--by-filename":
             by_filename = True; i += 1
+        elif a == "--drum-split":
+            drum_split = True; i += 1
         elif a == "--plan":
             plan_path = args[i + 1]; i += 2
         elif a == "--slot":
@@ -848,8 +1018,10 @@ def main(argv):
         print(f"--div must be one of {sorted(DIVISIONS)}"); return 1
     if length is not None and not (1 <= length <= 16):
         print("--length must be 1..16"); return 1
-    if cycles_mode not in (None, "bars"):
-        print("--cycles must be 'bars' (or omitted)"); return 1
+    if cycles_mode not in (None, "bars", "auto"):
+        print("--cycles must be 'auto', 'bars', or 'off'"); return 1
+    if length is not None and cycles_mode == "auto":
+        cycles_mode = None       # an explicit single-bar loop length overrides auto-cycles
     if not (1 <= steps <= 64):
         print("--steps must be 1..64"); return 1
     if cycle_count is not None and not (1 <= cycle_count <= 16):
@@ -874,6 +1046,7 @@ def main(argv):
                                    steps=steps, cycle_count=cycle_count, div=div, length=length)
     else:
         plan = plan_per_file(inputs[:16], bank=slot, backup=backup, split=split,
+                             drum_split=drum_split,
                              cycles_mode=cycles_mode, steps=steps, cycle_count=cycle_count,
                              div=div, length=length)
 

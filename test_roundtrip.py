@@ -20,16 +20,16 @@ def block_template_and_fields(data, run, block_hi):
     # locks may live in the base track OR a per-cycle record; both add the terminator that
     # parse_track folds into block_end, so subtract the FULL terminator to recover `steps`.
     cyc = C.parse_for_rebuild(data, run, block_hi)
-    base_term = 1 if (t["pitch_locks"] or t["groove_locks"]) else 0
-    cyc_has_locks = any(g or p for _, _, g, p in cyc["cycle_records"])
-    term = 1 if (base_term or cyc_has_locks) else 0
+    # A "summary" block (carries locks OR is a device-authored summary-but-lockless block, e.g.
+    # project.zip's first track) has a trailing terminator byte and its end-marker at 0x2b6;
+    # a plain block has neither (marker at 0x2b5). parse_track flags this as `summary_form`.
+    term = 1 if t["summary_form"] else 0
     so = t["block_end"] - F.TAIL_AFTER_STEPS - term          # parse's own steps offset
     block_end = t["block_end"]
     steps_region = data[so: so + F.TAIL_AFTER_STEPS]
     # base groove locks raw (param-id keyed) for exact rebuild
     groove_raw, pitch_raw, _ = C._parse_lock_list_raw(data, run + F.OFF_LOCKS)
-    # the position end-marker lives at steps+0x2b6 on lock blocks, steps+0x2b5 on non-lock
-    end_mark = steps_region[0x2b6 if (base_term or cyc_has_locks) else 0x2b5]
+    end_mark = steps_region[0x2b6 if t["summary_form"] else 0x2b5]
     fields = dict(
         gate=t["gate"], pitches=t["pitches"], steps=t["steps"],
         division=t["division_ticks"], scale=t["scale"], root=t["root"],
@@ -78,9 +78,11 @@ def test_file(path):
     pats = F.group_patterns(tracks)
     # slice rebuilt_blocks into the same pattern grouping; recover real slot indices from
     # each pattern's 4-byte gap header (first pattern is slot 0)
-    patterns, indices, cursors, idx = [], [0], [], 0
+    patterns, indices, cursors, first_slots, idx = [], [0], [], [], 0
     for k, p in enumerate(pats):
         patterns.append(rebuilt_blocks[idx:idx + len(p)])
+        # first serialized track's slot: byte 0x09 (pattern 0) / gap-header 3rd byte (block-2)
+        first_slots.append((data[0x09] if k == 0 else data[p[0]["block_start"] - 2]) + 1)
         if k > 0:
             indices.append(data[p[0]["block_start"] - 4])      # slot byte in the gap header
         # per-pattern saved track cursor = trailer[+2]. Read from the trailer's actual file
@@ -92,7 +94,8 @@ def test_file(path):
             cursors.append(data[len(data) - 16 - 8 + 2])       # before 12B summary + "os|t"
         idx += len(p)
     rebuilt_bank = M.build_bank(patterns, current_pattern=data[-11], indices=indices,
-                                final_has_locks=final_has_locks, track_cursors=cursors)
+                                final_has_locks=final_has_locks, track_cursors=cursors,
+                                first_slots=first_slots)
     if rebuilt_bank != data:
         n = next((k for k in range(min(len(rebuilt_bank), len(data)))
                   if rebuilt_bank[k] != data[k]), min(len(rebuilt_bank), len(data)))

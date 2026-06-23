@@ -172,17 +172,31 @@ a controlled order:
   read K=12 (locks entered 1→5→9→13 → newest = step 13 = 0-based 12). The earlier `samples/11`
   K=8-on-[0,4,8,12] "anomaly" was just hand-edit order.
 - end-marker = position value `m` (STRUCTURAL — a wrong value makes the device silently DROP or
-  mis-slot the track, hardware-confirmed). It sits at **`steps+0x2b5` on a NON-lock block**
-  (`+0x2b6`=0) and at **`steps+0x2b6` on a LOCK block** (`+0x2b5`=0). Synthesis must set the
-  right one for **both** kinds — leaving a non-lock block's `+0x2b5` at the template's `1`
-  dropped every position-≥2 non-lock track on device (iteration-10-hwtest v1). **Rule (corrected via iter9/iter10, N up to 12): `m = i + 1` for every
-  track except the pattern's LAST, which is `1`** (Form Y) — e.g. 8-track pattern =
-  `[1,2,3,4,5,6,7,1]`, 12-track = `[1,2,…,11,1]`, 3-track = `[1,2,1]`, 1-track = `[1]`. (The
-  earlier `N − i` rule only *coincided* for N ≤ 3, which is all the first hwtest patterns had;
-  it is wrong for N > 3.) The bank's final block may instead be Form X (`m = 0`, marker carried
-  by the terminator) — see "Final lock block".
-  A is `1` whenever locks present (the `samples/11` A=2 final-block case is the Form-X variant,
-  below); K is cursor state (any in-range locked step loads).
+  mis-slot the track, hardware-confirmed). It sits at **`steps+0x2b5` on a PLAIN block**
+  (`+0x2b6`=0) and at **`steps+0x2b6` on a SUMMARY block** (`+0x2b5`=0). A SUMMARY block is one
+  carrying locks (or a device-authored lockless summary block); a positional GAP does NOT force
+  summary form. **`m = (next serialized track's position) − 1`** — i.e. it points at where the
+  NEXT track lives, so empty slots between tracks are simply skipped (NOT padded). The pattern's
+  LAST track uses a UI sentinel = the number of selected tracks (default `1`). For a CONTIGUOUS
+  pattern this reduces to `m = i + 1` with last `1`, e.g. 12-track = `[1,2,…,11,1]`. The bank's
+  final block may instead be Form X (`m = 0`, marker carried by the terminator) — see "Final lock
+  block". A is `1` whenever locks present; K is cursor state.
+
+### Track positions (sparse layouts) — HARDWARE-DECODED (project*.zip)
+Only non-empty tracks are serialized, yet each keeps its absolute 1-based **slot** (1..16). Slot is
+NOT derived from the MIDI channel (multiple tracks may share a channel — e.g. a split drum kit).
+Two fields carry it:
+- **First serialized track's slot − 1** is stored in **byte `0x09`** (pattern 0) and in the **3rd
+  byte of each later pattern's 4-byte gap header** (`block_start − 2`). project3.zip (a lone track
+  on slot 8) stores `0x09 = 7`; every slot-1-first bank stores `0`.
+- **Each block's end-marker = next track's slot − 1** chains the rest (above). So positions =
+  `[0x09]+1`, then `prev_marker + 1` per block.
+Hardware refs: `samples/18_sparse_track16` (slots 1,16 — rebuilds byte-for-byte),
+`samples/19_first_track8` (lone slot 8). project2.zip (slots 1,4,5,8,16) confirmed the chain across
+multiple gaps and that **plain `0x2b5` markers jump across gaps** (its 5→8 and 8→16 gaps are plain).
+The **bank end-trailer** is `00 00 <selected tracks, 0-based, in selection order> 00 00 00 00 00`
+(variable length): 1 selection = `…<cur>…` (8 B), 4 selections (project2 tracks 9-12) =
+`00 00 0b 09 08 0a 00 00 00 00 00` (11 B). Synthesis writes a single selection (the highest track).
 
 **Why a lock track loads or drops (all hardware-confirmed):**
 1. A lock-bearing block must have the summary **present** (A=1 + the record), not the non-lock

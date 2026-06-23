@@ -32,6 +32,22 @@ Reverse-engineering the Torso T-1 sequencer's backup format to import/export pat
   (`.claude/skills/midi-to-t1`) runs the interview→convert→verify. The full converter output —
   `--cycles bars` natural encoding + corrected sustain in a `--new-backup` **fresh single-bank file**
   — **loaded & rendered correctly on device** (2026-06-22). See FORMAT.md.
+- **Drum-track splitting + SPARSE TRACK POSITIONS (2026-06-23) — HARDWARE-VERIFIED:** the importer
+  explodes a drum part (one channel, many GM pitches) into **one T-1 track per drum sound** on
+  **fixed slots** — kick=16, snare=15, closed-hat=14, open-hat=13, clap=12, others below; >8 sounds
+  collapse by GM family; each single-pitch track has **no per-step pitch lock**; all drum tracks
+  **share the source channel**. CLI `--drum-split`; plan `"drum_split":true` or per-track
+  `"track":slot` + `"pitches":[..]`. **Cycles are auto** (`--cycles auto`, the default): a voice
+  spanning >1 bar becomes cycles, else single — drum kits share one cycle count so they stay
+  phase-locked; per-step locks are emitted ONLY where a step differs from the track default (fewest
+  edited steps). This needed **absolute track positions with gaps** (a track on slot 16 with empty
+  slots below), **DECODED** from device backups: the first track's slot−1 lives in **header byte
+  `0x09`** (and each later pattern's gap-header 3rd byte), and **each block's end-marker = next
+  track's slot − 1** chains the rest (the old `i+1` rule is the contiguous special case). Empty
+  slots are **skipped, not padded**. `samples/18_sparse_track16` + `samples/19_first_track8` rebuild
+  byte-for-byte; `make_drumsplit_hwtest.py` → `hwtest/drumsplit_dawning.zip` **loaded & rendered
+  correctly on device** (drums on the right slots, kit-default steps, edits only where dynamics
+  change). See FORMAT.md "Track positions".
 - **Fixes / choices made during hardware verification:**
   1. **Final-block lock terminator** (CONFIRMED format rule, invisible to parser/roundtrip — no
      sample exercised it): the bank's last block, if it carries locks, uses a terminator byte =
@@ -74,14 +90,16 @@ was the trailing lock-summary + load rules (resolved; see FORMAT.md).
 - `t1_to_midi.py` — exporter. `python3 t1_to_midi.py FILE.t1 -o OUTDIR [--bpm 120]`
   writes one `.mid` per non-empty pattern (Type 1; 96 PPQN to match the device).
 - `midi_to_t1.py` — importer. `python3 midi_to_t1.py -o OUT.t1 IN1.mid [IN2.mid …]`
-  `[--div 16] [--length N] [--split-tracks] [--cycles bars] [--steps N] [--cycle-count N]
-  [--zip BACKUP.zip --slot N] [--template FILE]`. Each `.mid` → one pattern; each MIDI channel
-  (or **SMF track** with `--split-tracks`) with notes → one track; chords/pitch-changes → pitch
-  locks; per-step velocity/length → groove locks. **Cycles: DONE** — `--cycles bars` distributes
-  each voice's consecutive `--steps`-long windows across cycles (window k → cycle k, steps 1–64),
-  using the device's natural encoding (base = cycle 0 with its locks; a per-cycle record only when
-  a cycle differs — a repeated bar needs none). `--zip/--slot` emits a device-loadable backup
-  directly (folds in the splice). Scale/root default Chromatic/C (absolute pitch plays exactly).
+  `[--div 16] [--length N] [--split-tracks] [--drum-split] [--cycles bars] [--steps N]
+  [--cycle-count N] [--zip BACKUP.zip --slot N] [--template FILE]`. Each `.mid` → one pattern; each
+  MIDI channel (or **SMF track** with `--split-tracks`) with notes → one track; chords/pitch-changes
+  → pitch locks; per-step velocity/length → groove locks. **Cycles: DONE** — `--cycles bars`
+  distributes each voice's consecutive `--steps`-long windows across cycles (window k → cycle k,
+  steps 1–64), using the device's natural encoding (base = cycle 0 with its locks; a per-cycle
+  record only when a cycle differs — a repeated bar needs none). **Drum split: `--drum-split`** (or
+  plan `"drum_split":true`) explodes a drum part into one fixed-slot track per GM sound (kick=16…
+  clap=12, rest below; >8 collapse by family; single-pitch tracks have no pitch lock). `--zip/--slot`
+  emits a device-loadable backup directly. Scale/root default Chromatic/C (absolute pitch plays).
 - `test_roundtrip.py` — self-test: rebuilds every sample bank byte-for-byte (run after any
   change to the block/container synthesis or the parser). Now includes the multi-pattern/
   lock-last regression (`samples/11_multipattern_locklast/handmade.t1`).
@@ -94,6 +112,10 @@ was the trailing lock-summary + load rules (resolved; see FORMAT.md).
   *synthesis* (the two device cycle banks rebuild byte-for-byte in `test_roundtrip.py`).
 - `make_hwtest_midi.py` — generates the dependency-free test MIDI (`hwtest/p1_routing.mid`,
   `hwtest/p2_dynamics.mid`) used for hardware verification.
+- `make_drumsplit_hwtest.py` — builds `hwtest/drumsplit_dawning.zip` (The Dawning: melodic on
+  slots 1.. + split drums on fixed slots 9–16, 3 patterns) to verify drum splitting + sparse
+  track positions on device. Parser now reports each track's `position` (`t1_format.py` CLI shows
+  `trk#N`); `samples/18_sparse_track16` & `samples/19_first_track8` are device sparse-layout refs.
 - `make_2mid_cycles.py` — worked one-off: `midi/2.mid` → 2 tracks × 8 cycles (the original
   all-records cycle encoding; superseded by `midi_to_t1.py --cycles bars` but kept as a record).
 - `.claude/skills/midi-to-t1/` — guided import **skill**: inspect MIDI → recommend mapping (split/

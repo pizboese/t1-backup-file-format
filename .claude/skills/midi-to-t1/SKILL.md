@@ -24,7 +24,26 @@ for f in ["FILE.mid", ...]:
 PY
 ```
 Key things to surface: how many **musical parts** (SMF tracks), whether parts **share a channel**
-(→ need `--split-tracks`), and the **bar count** (→ whether cycles help).
+(→ need `--split-tracks`), the **bar count** (→ whether cycles help), and whether any part is a
+**drum/percussion** part (name matches `drum|drums|perc`, or pitches sit in the GM range 35–51 /
+MIDI channel 10 → use `midi_to_t1.gm_drum_name(note)` to list the kit).
+
+## 1b. Drum parts → one track per drum sound
+A drum part (one channel, many GM pitches) should NOT become a single locked track. Detect it
+(name/channel/GM-range), then **always confirm with the user** before splitting. When confirmed,
+split it into ONE T-1 track per drum sound (GM map) so each is soloable live and plays a single
+constant pitch with NO per-step pitch lock. **Fixed slots** (live-performance anchors):
+kick=16, snare=15, closed-hat=14, open-hat=13, clap=12; other drums fill 11,10,9 then empty
+priority slots; melodic parts go on slots 1.. upward. Hard cap = 8 drum tracks (slots 9–16).
+- **≤ 8 distinct drum pitches** → one track each (no interview needed beyond the "drums?" confirm).
+- **> 8** → priority drums keep their slots; the rest **collapse by GM family** (toms / cymbals /
+  other perc) into the remaining slots (those tracks DO use per-step pitch locks). Ask the user how
+  to group; default = group-by-family. `midi_to_t1.assign_drum_slots(pitches)` shows the mapping.
+
+Emit via the plan: a drum trackspec is `{"midi": "...", "drum_split": true}` (optionally
+`"out_channel": N` to force the shared channel, `"max_drum_tracks": N`). For full control of the
+overflow grouping, instead emit one trackspec per track with an explicit `"track": slot` and a
+`"pitches": [..]` filter. Quick CLI (drums-only file): `--drum-split`.
 
 ## 2. Decide the mapping WITH the user
 Ask (AskUserQuestion) the things the source leaves ambiguous — but if the user already gave a
@@ -42,11 +61,13 @@ Then settle the per-track shape (recommendations):
 - **Parts → tracks:** if a file has >1 SMF part (esp. sharing a channel), use `--split-tracks` (or,
   in a plan, one trackspec per `smf_track`) so each part is its own T-1 track.
 - **Length / cycles:** a T-1 track is **16 steps shown, up to 64 stored**; one pattern = 16 tracks.
-  - 1 window long → no cycles.
-  - **multi-bar** → `--cycles bars`: consecutive `--steps`-long windows become cycles (window k →
-    cycle k; proven). Confirm **cycle count** (auto = #windows with notes, max 16) and **steps**
-    (1–64, default 16). Too long for 16 cycles → coarsen `--div`, raise `--steps`, or split across
-    patterns/banks; flag the trade-off, never silently truncate.
+  - **Cycles are AUTO by default** (`--cycles auto`): a voice spanning >1 `--steps` window becomes
+    cycles (window k → cycle k); a single-bar voice stays one cycle. `--cycles bars` forces it,
+    `--cycles off` (or `--length N`) forces a single bar. So multi-bar sources are never silently
+    truncated. Confirm **steps** (1–64, default 16). Too long for 16 cycles → coarsen `--div`, raise
+    `--steps`, or split across patterns/banks; flag the trade-off.
+  - **Drum kits stay phase-locked:** all split drum tracks get ONE kit-wide cycle count (a drum that
+    only plays in bar 1 goes silent in later cycles rather than looping early).
 
 ## 3. Choose the backup target, then build
 Ask TWO things: (a) **fresh single-bank file** or **based on an existing backup**, and (b) **which
@@ -71,6 +92,9 @@ python3 midi_to_t1.py -o OUT.t1 --plan plan.json
 ```
 `--plan` JSON schema (see `run_plan` docstring): `{"backup":"new"|"<path>", "bank":N, "patterns":[
 {"slot":0,"tracks":[{"midi":"a.mid","track":1,"smf_track":0,"cycles":"bars","steps":16}, …]}]}`.
+`track` is the **absolute slot** (drums on 9–16, melodic on 1.. coexist via skipped slots). A drum
+part is `{"midi":"d.mid","drum_split":true}`; for custom overflow grouping use one trackspec per
+track with `"track":slot` + `"pitches":[..]`.
 
 ## 4. Verify before handing it over
 ```bash

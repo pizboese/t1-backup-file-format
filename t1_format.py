@@ -23,6 +23,14 @@ PAD_AFTER_LOCKS = 18            # fixed padding between lock lists and `steps`
 S_CYCLES = 0x14d    # cycle count (1-16, default 4)
 S_STEPGROUP = 0x2b0 # step-group page selector (UI cursor): 0=1-16 1=17-32 2=33-48 3=49-64
 
+# tail of the steps-region: per-block lock-summary + position end-marker (see FORMAT.md
+# "TRUE chord blocker" / track positions). The end-marker encodes the NEXT serialized track's
+# position minus 1 (last track of a pattern = 1); empty tracks between are skipped, not stored.
+S_LOCK_FLAG = 0x29c   # 0 = plain block; !=0 = "summary" form (has locks OR a positional gap)
+S_LOCK_CURSOR = 0x2a0 # u16: last-edited lock step (lock blocks) OR #empty tracks skipped (gap)
+S_END_2B5 = 0x2b5     # end-marker on a PLAIN block (summary block: 0)
+S_END_2B6 = 0x2b6     # end-marker on a SUMMARY block (plain block: 0)
+
 # offsets relative to the `steps` field (which is pushed later by the lock region)
 S_DIVISION = 0x2a   # u16 LE: ticks/step @96 PPQN (value*divisor = 384)
 S_SCALE = 0x40
@@ -143,7 +151,15 @@ def parse_track(data, run, block_hi=None):
     # A block carrying any lock has a single terminator byte after the steps region. Locks may
     # live in the base track OR in a per-cycle record; the device sets the lock-summary flag
     # (steps+0x29c) whenever ANY are present, so use it to detect cycle-only lock blocks too.
-    lock_term = 1 if (groove_locks or pitch_locks or data[so + 0x29c]) else 0
+    lock_term = 1 if (groove_locks or pitch_locks or data[so + S_LOCK_FLAG]) else 0
+    # Position end-marker. Value = (next serialized track's position) - 1; the pattern's last
+    # track uses a cursor sentinel (parse_bank ignores it). It sits at 0x2b6 on a SUMMARY block
+    # (one carrying locks; 0x29c != 0) and at 0x2b5 on a PLAIN block. A positional gap does NOT
+    # by itself force summary form — a plain block's 0x2b5 marker can jump (device-confirmed by
+    # project2.zip: tracks 1,4,5,8,16, where the 5->8 and 8->16 gaps are PLAIN). parse_bank turns
+    # these markers into absolute `position`s.
+    summary_form = data[so + S_LOCK_FLAG] != 0
+    end_marker = data[so + S_END_2B6] if summary_form else data[so + S_END_2B5]
     mask = data[so + S_MIDIMASK] | (data[so + S_MIDIMASK + 1] << 8)
     channels = [c + 1 for c in range(16) if mask & (1 << c)]
     div_ticks = data[so + S_DIVISION] | (data[so + S_DIVISION + 1] << 8)
@@ -173,6 +189,9 @@ def parse_track(data, run, block_hi=None):
         "midi_channels": channels,
         "pitch_locks": pitch_locks,               # step(0-based) -> [pitches]
         "groove_locks": groove_locks,             # step(0-based) -> {param: value}
+        "summary_form": summary_form,             # block carries locks (marker lives at 0x2b6)
+        "end_marker": end_marker,                 # raw marker = next track's position - 1 (last=cursor)
+        # "position" (1-based track slot in its pattern) is filled by parse_bank.
     }
 
 
@@ -201,8 +220,21 @@ def parse_bank(path):
     starts = [_pitch_count_and_start(data, r)[1] for r in runs]
     his = starts[1:] + [len(data)]
     tracks = [parse_track(data, r, block_hi=h) for r, h in zip(runs, his)]
+    patterns = group_patterns(tracks)
+    # Assign each track its 1-based position within its pattern. The FIRST serialized track's slot
+    # is stored explicitly: byte 0x09 for pattern 0, and the 3rd byte of each later pattern's
+    # 4-byte gap header (block_start-2) — value = first_slot - 1 (device-confirmed by project3.zip:
+    # a lone track on slot 8 stores 0x09=7). Each subsequent track's position = previous block's
+    # end-marker + 1 (the marker = next_position - 1, so empty slots between tracks are recovered).
+    # The pattern's last block's marker is a UI sentinel (selection count) and is not used.
+    for pi, pat in enumerate(patterns):
+        first_slot = (data[0x09] if pi == 0 else data[pat[0]["block_start"] - 2]) + 1
+        pos = first_slot
+        for t in pat:
+            t["position"] = pos
+            pos = t["end_marker"] + 1
     return {"path": path, "size": len(data), "version": "2.1.4",
-            "tracks": tracks, "patterns": group_patterns(tracks)}
+            "tracks": tracks, "patterns": patterns}
 
 
 def main(argv):
@@ -214,7 +246,8 @@ def main(argv):
         for i, t in enumerate(bank["tracks"]):
             cyc = f" cycles={t['cycles']}" if t['cycles'] != 4 else ""
             grp = f" page={t['step_group']+1}/4" if t['step_group'] else ""
-            print(f"  block {i:2d}: pitches={t['pitches']} steps={t['steps']}{cyc}{grp} "
+            pos = f" trk#{t.get('position', '?')}"
+            print(f"  block {i:2d}:{pos} pitches={t['pitches']} steps={t['steps']}{cyc}{grp} "
                   f"div={t['division_label']} root={t['root_name']} scale={t['scale_name']} "
                   f"vel={t['velocity']} sus={t['sustain']} "
                   f"ch={t['midi_channels']} pulses={t['active_steps']}")
