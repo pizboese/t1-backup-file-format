@@ -8,13 +8,15 @@ Usage:
 Writes one .mid per non-empty pattern (Type 1: one MIDI track per T-1 track).
 Dependency-free SMF writer.
 
-Decoded fields used: gate array, steps(length), per-track division (timing), pitches
-(absolute, C3=60), velocity, sustain, MIDI channel mask. See FORMAT.md.
+Decoded fields used: gate array, steps, per-track division, pitches (absolute, C3=60), per-step
+pitch/velocity/sustain locks, MIDI channel mask, bank Tempo (->BPM), track Length (->loop end),
+and Timing/Delay (->note onset shifts). See FORMAT.md.
 
-Approximations (not yet reverse-engineered — see FORMAT.md "Still open"):
-  * note length derived from `sustain` (0..127) as a fraction of the step.
-  * per-step pitch/vel overrides not applied (uses track-level values).
+Approximations (see FORMAT.md "Still open" / "Backup-1 decode"):
+  * note length derived from `sustain` via the device log law.
+  * Timing/Delay applied with a PROVISIONAL 1 unit ≈ 1 tick scale (real units TBD — follow-up).
   * scale/root quantization not applied (exports the stored absolute pitch).
+  * --bpm overrides the bank's stored Tempo.
 """
 import struct
 import sys
@@ -23,6 +25,23 @@ import os
 import t1_format
 
 TPQN = t1_format.PPQN   # 96, matches the T-1 internal resolution (division in ticks)
+BAR_TICKS = TPQN * 4    # one 4/4 bar in ticks (Length is in bars; see length_to_ticks)
+
+# PROVISIONAL: the exact tick scale of Timing (swing) and Delay (track shift) is a pending
+# follow-up — backup-1 located the signed fields but not their real-world units. Until a dedicated
+# sweep pins it, treat 1 stored unit ≈ 1 tick @96 PPQN. Both default to 0 (no shift), so this is a
+# no-op for any track that doesn't use them (existing exports are unchanged).
+TIMING_TICKS_PER_UNIT = 1
+DELAY_TICKS_PER_UNIT = 1
+
+
+def length_to_ticks(length_enum, step_count, step_ticks):
+    """Track loop length in ticks from the Length enum (backup-1). Infinite (or unknown) falls back
+    to the natural step span (step_count * step_ticks)."""
+    bars = t1_format.LENGTH_BARS.get(length_enum)
+    if bars is None:
+        return step_count * step_ticks
+    return max(1, round(bars * BAR_TICKS))
 
 
 def _sustain_steps(sus_byte):
@@ -63,13 +82,18 @@ def build_smf(patterns, bpm):
             chans = t["midi_channels"]
             if not chans or not t["pitches"]:
                 continue
-            length = t["steps"] or 16
+            step_count = t["steps"] or 16
             step_ticks = t["division_ticks"] or 24
+            # Timing (swing) shifts every 2nd step; Delay shifts the whole track. Units provisional
+            # (see TIMING_TICKS_PER_UNIT); both 0 by default -> no change. (backup-1)
+            delay_off = t.get("delay", 0) * DELAY_TICKS_PER_UNIT
+            swing_off = t.get("timing", 0) * TIMING_TICKS_PER_UNIT
             # collect (tick, on/off, chan, note, vel) — applying per-step overrides
             events = []
-            for s in range(length):
+            for s in range(step_count):
                 if s < 16 and t["gate"][s]:
-                    on = s * step_ticks
+                    on = s * step_ticks + delay_off + (swing_off if s % 2 else 0)
+                    on = max(0, on)
                     notes = t["pitch_locks"].get(s, t["pitches"])
                     gl = t["groove_locks"].get(s, {})
                     vel = gl.get("velocity", t["velocity"])
@@ -90,8 +114,10 @@ def build_smf(patterns, bpm):
                 ev += _vlq(tick - last)
                 ev += bytes([(0x90 if kind else 0x80) | (ch & 0x0f), note, vel])
                 last = tick
-            # loop end marker
-            ev += _vlq(max(0, length * step_ticks - last))
+            # loop end marker — use the track's Length (loop length in bars), falling back to the
+            # natural step span when infinite/unset (backup-1).
+            loop_ticks = length_to_ticks(t.get("length", 0), step_count, step_ticks)
+            ev += _vlq(max(0, loop_ticks - last))
             ev += bytes([0xFF, 0x2F, 0x00])
             tracks_out.append(bytes(ev))
 
@@ -107,7 +133,7 @@ def main(argv):
         print(__doc__); return 1
     path = args[0]
     outdir = "."
-    bpm = 120.0
+    bpm = None
     i = 1
     while i < len(args):
         if args[i] == "-o":
@@ -117,6 +143,8 @@ def main(argv):
         else:
             i += 1
     bank = t1_format.parse_bank(path)
+    if bpm is None:                       # default to the bank's stored Tempo (backup-1); --bpm wins
+        bpm = bank["tempo"] or 120.0
     # one .mid per pattern that has any playable track
     base = os.path.splitext(os.path.basename(path))[0]
     os.makedirs(outdir, exist_ok=True)

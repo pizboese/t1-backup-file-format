@@ -34,11 +34,33 @@ S_END_2B6 = 0x2b6     # end-marker on a SUMMARY block (plain block: 0)
 # offsets relative to the `steps` field (which is pushed later by the lock region)
 S_DIVISION = 0x2a   # u16 LE: ticks/step @96 PPQN (value*divisor = 384)
 S_SCALE = 0x40
+S_PROBABILITY = 0x79  # s8, center 0 (− pulses-only / + all-notes); 2 B before velocity (backup-1)
 S_VELOCITY = 0x7b
+S_TIMING = 0xba     # s8, center 0: swing amount (every 2nd step earlier/later) (backup-1)
 S_SUSTAIN = 0xa5
 S_MIDIMASK = 0xe4   # u16 LE
+S_DELAY = 0x13e     # s8, center 0: whole-track shift against the grid (backup-1)
 S_ROOT = 0x13f
+S_TIMING_SUB = 0x146  # timing subdivision enum (/1=4 /2=5 /4=3; default /1=4) (backup-1)
+S_LENGTH = 0x14b    # track loop-length enum 0-15 (distinct from `steps`; see LENGTH_BARS) (backup-1)
+S_FREEDIV = 0x299   # free-division flag: 0=fixed, 1=free (value stays the S_DIVISION u16) (backup-1)
 TAIL_AFTER_STEPS = 0x2b7        # steps .. block end (fixed per-step region)
+
+# Length enum (S_LENGTH) -> loop length in BARS (None = infinite). Default 0 = 1 bar. backup-1.
+LENGTH_BARS = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: None,
+               9: 0.5, 10: 0.25, 11: 0.125, 12: 0.0625, 13: 0.03125, 14: 0.015625, 15: 16}
+
+
+def _s8(v):
+    """Interpret a stored byte as a signed int8 (bipolar params: Timing, Delay, Probability)."""
+    return v - 256 if v > 127 else v
+
+
+def length_label(enum):
+    bars = LENGTH_BARS.get(enum)
+    if bars is None:
+        return "inf"
+    return f"{bars}bar" if bars >= 1 else f"1/{int(round(1 / bars))}"
 
 GROOVE_PARAMS = {0x0a: "velocity", 0x0e: "sustain"}
 PPQN = 96                       # T-1 internal: quarter note = 96 ticks
@@ -185,6 +207,13 @@ def parse_track(data, run, block_hi=None):
         "root_name": NOTE_NAMES[root] if root < 12 else "?",
         "velocity": data[so + S_VELOCITY],
         "sustain": data[so + S_SUSTAIN],
+        "probability": _s8(data[so + S_PROBABILITY]),  # signed; center 0 (backup-1)
+        "timing": _s8(data[so + S_TIMING]),            # signed swing amount; center 0 (backup-1)
+        "timing_sub": data[so + S_TIMING_SUB],         # subdivision enum (/1=4 /2=5 /4=3)
+        "delay": _s8(data[so + S_DELAY]),              # signed track shift; center 0 (backup-1)
+        "length": data[so + S_LENGTH],                 # loop-length enum 0-15 (distinct from steps)
+        "length_bars": LENGTH_BARS.get(data[so + S_LENGTH]),  # bars (None=infinite)
+        "free_division": bool(data[so + S_FREEDIV]),   # True = free (non-grid) division mode
         "midi_mask": mask,
         "midi_channels": channels,
         "pitch_locks": pitch_locks,               # step(0-based) -> [pitches]
@@ -233,8 +262,19 @@ def parse_bank(path):
         for t in pat:
             t["position"] = pos
             pos = t["end_marker"] + 1
-    return {"path": path, "size": len(data), "version": "2.1.4",
-            "tracks": tracks, "patterns": patterns}
+    # Tempo (global, per-bank) = first 2 bytes of the 12-B bank summary (u16 LE BPM); the summary
+    # sits in the last 16 bytes (12 + "os|t"). Per-pattern Quantize = the 4th byte of each pattern's
+    # 8-B end trailer (`00 00 <cursor> <quantize> 00 00 00 00`). Both decoded in backup-1.
+    tempo = data[len(data) - 16] | (data[len(data) - 15] << 8)
+    quantize = []
+    for pi, pat in enumerate(patterns):
+        if pi < len(patterns) - 1:
+            q_off = patterns[pi + 1][0]["block_start"] - 12 + 3   # trailer 4th byte
+        else:
+            q_off = len(data) - 16 - 8 + 3                        # final trailer before summary
+        quantize.append(data[q_off])
+    return {"path": path, "size": len(data), "version": "2.1.4", "tempo": tempo,
+            "tracks": tracks, "patterns": patterns, "quantize": quantize}
 
 
 def main(argv):
@@ -242,15 +282,23 @@ def main(argv):
         print("usage: t1_format.py FILE.t1 ..."); return 1
     for p in argv[1:]:
         bank = parse_bank(p)
-        print(f"== {p}  ({bank['size']} B, {len(bank['tracks'])} track block(s)) ==")
+        print(f"== {p}  ({bank['size']} B, {len(bank['tracks'])} track block(s), "
+              f"tempo={bank['tempo']} BPM, quantize={bank['quantize']}) ==")
         for i, t in enumerate(bank["tracks"]):
             cyc = f" cycles={t['cycles']}" if t['cycles'] != 4 else ""
             grp = f" page={t['step_group']+1}/4" if t['step_group'] else ""
             pos = f" trk#{t.get('position', '?')}"
+            extra = "".join([
+                f" timing={t['timing']}" if t['timing'] else "",
+                f" delay={t['delay']}" if t['delay'] else "",
+                f" prob={t['probability']}" if t['probability'] else "",
+                f" len={length_label(t['length'])}" if t['length'] else "",
+                " free-div" if t['free_division'] else "",
+            ])
             print(f"  block {i:2d}:{pos} pitches={t['pitches']} steps={t['steps']}{cyc}{grp} "
                   f"div={t['division_label']} root={t['root_name']} scale={t['scale_name']} "
                   f"vel={t['velocity']} sus={t['sustain']} "
-                  f"ch={t['midi_channels']} pulses={t['active_steps']}")
+                  f"ch={t['midi_channels']} pulses={t['active_steps']}{extra}")
             if t["pitch_overrides"]:
                 print(f"           cycle-pitch: {{{', '.join(f'cyc{c+1}:{v}' for c,v in t['pitch_overrides'])}}}"
                       + (f"  (+{t['num_edited_cycles']} edited-cycle step-seq record(s))" if t['num_edited_cycles'] else ""))

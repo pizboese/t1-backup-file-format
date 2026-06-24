@@ -78,24 +78,25 @@ def test_file(path):
     pats = F.group_patterns(tracks)
     # slice rebuilt_blocks into the same pattern grouping; recover real slot indices from
     # each pattern's 4-byte gap header (first pattern is slot 0)
-    patterns, indices, cursors, first_slots, idx = [], [0], [], [], 0
+    patterns, indices, cursors, first_slots, quantize, idx = [], [0], [], [], [], 0
     for k, p in enumerate(pats):
         patterns.append(rebuilt_blocks[idx:idx + len(p)])
         # first serialized track's slot: byte 0x09 (pattern 0) / gap-header 3rd byte (block-2)
         first_slots.append((data[0x09] if k == 0 else data[p[0]["block_start"] - 2]) + 1)
         if k > 0:
             indices.append(data[p[0]["block_start"] - 4])      # slot byte in the gap header
-        # per-pattern saved track cursor = trailer[+2]. Read from the trailer's actual file
-        # position (robust to the Form-X final terminator+pad): each non-final pattern's trailer
-        # sits 12 B before the next pattern's first block; the final one 8 B before the summary.
-        if k < len(pats) - 1:
-            cursors.append(data[pats[k + 1][0]["block_start"] - 12 + 2])
-        else:
-            cursors.append(data[len(data) - 16 - 8 + 2])       # before 12B summary + "os|t"
+        # per-pattern saved track cursor = trailer[+2], Quantize = trailer[+3]. Read from the
+        # trailer's actual file position (robust to the Form-X final terminator+pad): each non-final
+        # pattern's trailer sits 12 B before the next pattern's first block; the final one 8 B before
+        # the summary.
+        trailer = (pats[k + 1][0]["block_start"] - 12) if k < len(pats) - 1 else (len(data) - 16 - 8)
+        cursors.append(data[trailer + 2])
+        quantize.append(data[trailer + 3])
         idx += len(p)
+    tempo = data[len(data) - 16] | (data[len(data) - 15] << 8)
     rebuilt_bank = M.build_bank(patterns, current_pattern=data[-11], indices=indices,
                                 final_has_locks=final_has_locks, track_cursors=cursors,
-                                first_slots=first_slots)
+                                first_slots=first_slots, tempo=tempo, pattern_quantize=quantize)
     if rebuilt_bank != data:
         n = next((k for k in range(min(len(rebuilt_bank), len(data)))
                   if rebuilt_bank[k] != data[k]), min(len(rebuilt_bank), len(data)))

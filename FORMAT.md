@@ -61,6 +61,56 @@ relative to block start; everything after the pitch list is at a **fixed offset 
 Pitch → MIDI note = stored byte directly (C3=60). Clamp/transpose values >127 for export.
 Scale is a display/quantize index only; it does not change the stored pitch.
 
+### Backup-1 decode (2026-06-24): Timing, Delay, Probability, Length, Quantize, Free-div, Timing-sub, Tempo
+Source: `backup1.zip` (one full backup). Method: one parameter per Pattern, the SAME base track
+**copied** across 16 tracks with only the target laddered, so the 16 blocks differ in exactly the
+target byte + the position end-marker (`+0x2b5`). Offsets relative to `steps` (= `run+0x60`).
+
+| Field | steps-rel | run-rel | Type | Notes |
+|-------|-----------|---------|------|-------|
+| **Probability** | `+0x079` | `run+0xd9`  | s8, center 0 | sign = direction (− pulses-only / + all-notes, per manual); sits 2 B before velocity value `+0x7b`. NOT a sequenced (random) param. |
+| **Timing (swing amount)** | `+0x0ba` | `run+0x11a` | s8, center 0 | value-byte of the Zone-A **Timing** record (random run `+0xbb` — Timing is a sequenced param). Bipolar swing; observed −20..+20 from VALUE buttons (full knob may exceed). |
+| **Delay (track shift)** | `+0x13e` | `run+0x19e` | s8, center 0 | static (not sequenced); adjacent to Style `+0x13d` / Root `+0x13f`. |
+| **Timing subdivision** | `+0x146` | `run+0x1a6` | enum | /1=4, /2=5, /4=3 (small enum, default /1=4; fuller sweep TBD). Scales the swing. |
+| **Length (track loop)** | `+0x14b` | `run+0x1ab` | enum 0–15 | **0=1 bar (def)**, 1–7 = 2–8 bar, 8=∞, 9=1/2, 10=1/4, 11=1/8, 12=1/16, 13=1/32, 14=1/64, 15=16 bar. **Distinct from Steps** (loop length, not step count). |
+| **Free-division flag** | `+0x299` | `run+0x2f9` | u8 bool | 0 = fixed division, 1 = free. The division **value** stays the same u16 at `+0x2a`; free mode just sets this flag + allows off-grid u16 values. |
+
+(Style `+0x13d`, Root `+0x13f`, Cycle-count `+0x14d` were already decoded — the new fields slot in
+between them.)
+
+**Tempo (global, per-bank) — CORRECTION to earlier RE:** the byte long documented as a constant
+`0x78` at the start of the 12-B **bank summary** is actually **Tempo (u16 LE, BPM)**. Default 120 =
+`78 00`; backup-1 banks read `18 00`=24 and `16 01`=278 (set to 24 / 280 — device landed on 278).
+So the summary is `<tempo:u16 LE> 00 00 00 <cur> <cur> 01 00 00 00 <cur>`. Range 24–280, stored as
+BPM directly (24→24 exact). Tempo lives ONLY in the bank summary, not in any track block.
+
+**Quantize (per-pattern) = 4th byte of the 8-B end-of-pattern trailer** (`00 00 <prev_tc-1>
+<quantize> 00 00 00 00`) — NOT a track-block field. Same enum as Length: backup-1 P6/P7/P8
+(Quantize VB1/VB8/VB16) wrote 11/0/15 = 1/8 bar / 1 bar / 16 bar. Each pattern carries its quantize
+in its own end trailer; default 0 (= 1 bar). (This is why a per-pattern value couldn't be isolated
+from the single-track-per-pattern blocks — it isn't in the block.)
+
+**Folded into the tools (2026-06-24):** the parser reports all of the above (`t1_format` track
+fields + bank `tempo`/`quantize`); `midi_to_t1` writes them (`build_track_block` patches Timing/
+Delay/Probability/Length/Free-div when given; `build_bank(tempo=, pattern_quantize=)`); CLI flags
+`--tempo`/`--timing`/`--delay`/`--track-length`; `t1_to_midi` reads `tempo`→BPM, `Length`→loop end,
+and applies Timing(swing)/Delay(shift) to onsets. `test_roundtrip` rebuilds the backup-1 banks
+(tempo 24/278, quantize 11/0/15) byte-for-byte.
+
+**Open follow-ups (backup-1):**
+- **Timing/Delay tick scale unknown** — the signed *fields* are located, but not their real-world
+  units (the VALUE buttons only sampled ±~20). `t1_to_midi` applies them with a PROVISIONAL
+  1 unit ≈ 1 tick @96 PPQN (`TIMING_TICKS_PER_UNIT`/`DELAY_TICKS_PER_UNIT`), and the importer takes
+  raw device values. A dedicated sweep (a few known swing/delay settings vs. measured note offsets)
+  is needed to pin the conversion.
+- **Timing subdivision enum** (`+0x146`: /1=4 /2=5 /4=3) only has 3 points — odd ordering; a fuller
+  sweep would confirm it.
+- **Per-step Timing/Delay lock** — the device would not let the user enter a per-step Timing edit
+  (the manual's per-step-editing page implies it should). Needs a different on-device access path,
+  or it may not be a per-step lock at all. Treat Timing/Delay as track-level for now.
+- **Length auto-derivation** — the importer sets Length only via `--track-length`; deriving it from
+  the MIDI clip length (steps×division → bars) would make it automatic.
+
 ### Validated by import round-trip (synthesized bank loaded on device)
 - A hand-patched `.t1` loads fine → **no checksum / integrity field** in the format.
 - **velocity & sustain are 0–127** (device shows them across 16 LEDs, ~8 per LED). Stored
@@ -355,8 +405,9 @@ per-cycle record carries per-step locks.
 
 ### Saved pattern cursor — CONFIRMED ISOLATED (`iteration10` banks 1 & 2)
 The "which pattern was selected when the backup was saved" cursor is the 0-based pattern **slot**,
-stored **only** in the 12-B bank summary: `78 00 00 00 00 <cur> <cur> 01 00 00 00 <cur>` (3 copies
-at summary offsets 5,6,11). Proven: two banks identical but for the selected pattern (P2 vs P1)
+stored **only** in the 12-B bank summary: `<tempo:u16 LE> 00 00 00 <cur> <cur> 01 00 00 00 <cur>`
+(3 copies at summary offsets 5,6,11; bytes 0–1 are **Tempo**, see Backup-1 decode). Proven: two
+banks identical but for the selected pattern (P2 vs P1)
 differed in **exactly those 3 bytes** (`01` vs `00`) — everything else is per-track random state.
 It touches no track/pattern content; `build_bank(current_pattern=…)` already emits it. Safe to
 set 0.
@@ -371,20 +422,23 @@ banks (`test_roundtrip.py`). Layout of a per-bank `.t1` holding multiple pattern
                                        tc0=first-pattern track-count (5 B)
 0x0b  P0 track blocks                  tc0 blocks
       ── per following serialized pattern ──
-      [8 B end-of-pattern trailer] = 00 00 <prev_tc-1> 00 00 00 00 00
+      [8 B end-of-pattern trailer] = 00 00 <prev_tc-1> <quantize> 00 00 00 00
       [4 B next-pattern header]    = <slot> <tc> 00 00
       <tc> track blocks
       ...
-      [8 B end-of-last-pattern trailer] = 00 00 <last_tc-1> 00 00 00 00 00
+      [8 B end-of-last-pattern trailer] = 00 00 <last_tc-1> <quantize> 00 00 00 00
 0xEnd [12 B bank summary] 6f 73 7c 74   bank trailer ("os|t")
 ```
 - **`<slot>`** = the device pattern slot (0–15) of the upcoming pattern. Only **used**
   patterns are serialized, so slots can be **sparse** (e.g. `04_pitch_vel_sustain` stores
   slots 0 and 2 = Patterns 1 & 3). The first serialized pattern is implicitly slot 0.
 - **`prev_tc-1`** = (track-count of the pattern that just ended) − 1.
-- **Bank summary (12 B):** `78 00 00 00 00 <cur> <cur> 01 00 00 00 <cur>` where `<cur>` is
-  the **saved cursor** — the pattern slot selected when the backup was taken (user state, not
-  derivable from content; the device opens the bank on it). 0 is always valid.
+- **`<quantize>`** (trailer 4th byte) = that pattern's **Quantize** (per-pattern; same enum as
+  Length — 0=1 bar default). Was previously read as a constant `00`. See Backup-1 decode.
+- **Bank summary (12 B):** `<tempo:u16 LE> 00 00 00 <cur> <cur> 01 00 00 00 <cur>` — **bytes 0–1 =
+  Tempo (BPM, 24–280; default 120 = `78 00`)**; `<cur>` (offsets 5,6,11) is the **saved cursor**
+  — the pattern slot selected when the backup was taken (the device opens the bank on it). Cursor 0
+  always valid.
 - A lock-bearing block's extra terminator byte (see above) lands inside these gaps, so the
   pattern-boundary gap measures 12 (lock-free last block) or 13 (last block has locks).
 

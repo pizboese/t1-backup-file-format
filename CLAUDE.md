@@ -48,6 +48,20 @@ Reverse-engineering the Torso T-1 sequencer's backup format to import/export pat
   byte-for-byte; `make_drumsplit_hwtest.py` → `hwtest/drumsplit_dawning.zip` **loaded & rendered
   correctly on device** (drums on the right slots, kit-default steps, edits only where dynamics
   change). See FORMAT.md "Track positions".
+- **Backup-1 parameter decode (2026-06-24, `backup1.zip` — one full backup, per-pattern monotonic
+  track sweeps):** newly located — **Probability** `steps+0x79` (s8), **Timing** amount `steps+0xba`
+  (s8) + subdivision `steps+0x146`, **Delay** `steps+0x13e` (s8), **Length** (track loop)
+  `steps+0x14b` (enum 0–15: 0=1bar…8=∞…14=1/64…15=16bar), **Free-division flag** `steps+0x299`
+  (0=fixed/1=free, value stays the `+0x2a` u16), **Quantize** = the per-pattern end-trailer's 4th
+  byte (same enum as Length), and **Tempo** = bank-summary bytes 0–1 (u16 LE BPM) — correcting the
+  old "constant `0x78`" (it was default tempo 120). Archived in `samples/20_backup1_params/`.
+  **Folded into importer + exporter (2026-06-24):** parser reports them; `midi_to_t1` writes them
+  (CLI `--tempo`/`--timing`/`--delay`/`--track-length`; `build_bank(tempo=,pattern_quantize=)`);
+  `t1_to_midi` reads `tempo`→BPM, `Length`→loop, applies Timing/Delay to onsets. `test_roundtrip`
+  rebuilds the backup-1 banks byte-for-byte. **Open follow-ups:** Timing/Delay tick-unit scale (used
+  provisionally as 1 unit≈1 tick), the 3-point Timing-subdivision enum, per-step Timing lock (device
+  wouldn't let the user enter one), and auto-deriving Length from MIDI clip length. See FORMAT.md
+  "Backup-1 decode".
 - **Fixes / choices made during hardware verification:**
   1. **Final-block lock terminator** (CONFIRMED format rule, invisible to parser/roundtrip — no
      sample exercised it): the bank's last block, if it carries locks, uses a terminator byte =

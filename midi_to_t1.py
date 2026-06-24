@@ -43,7 +43,13 @@ Options:
   --slot N           which bank 0..7 the content fills (default 0); used by --zip/--new-backup/plan.
   --template FILE    .t1 whose first track block seeds the per-track "stored state"
                      region (default: samples/10_synth_test_import/0.t1)
-  --bpm / ignored    tempo is a playback concern; the T-1 has its own clock.
+  --tempo BPM        bank tempo 24..280 (default 120); stored in the bank summary (backup-1).
+  --track-length S   per-track loop length: bars (1..8,16), a fraction (1/2..1/64), or 'inf'
+                     (the Length field, distinct from --steps; backup-1).
+  --timing N         per-track swing amount, signed device value (backup-1).
+  --delay N          per-track shift, signed device value (backup-1).
+                     NOTE: the exact tick/musical scale of --timing/--delay is a pending follow-up
+                     (backup-1 located the fields, not their units) — values are raw device units.
 
 Design: the format has no checksum (proven by on-device import). A track block contains a
 large per-track "random sequence" region that is device-generated stored state; we clone it
@@ -75,6 +81,12 @@ SR_VELOCITY = F.S_VELOCITY
 SR_SUSTAIN = F.S_SUSTAIN
 SR_MIDIMASK = F.S_MIDIMASK             # u16 LE
 SR_ROOT = F.S_ROOT
+SR_PROBABILITY = F.S_PROBABILITY       # s8 center 0 (backup-1)
+SR_TIMING = F.S_TIMING                 # s8 swing amount, center 0 (backup-1)
+SR_TIMING_SUB = F.S_TIMING_SUB         # subdivision enum (backup-1)
+SR_DELAY = F.S_DELAY                   # s8 track shift, center 0 (backup-1)
+SR_LENGTH = F.S_LENGTH                 # loop-length enum 0-15 (backup-1)
+SR_FREEDIV = F.S_FREEDIV               # free-division flag 0/1 (backup-1)
 SR_STYLE = 0x13d                       # voicing Style: poly(chord)=0-4, mono(arp)=8-12; 0=Fixed
 # trailing per-block lock-summary (see FORMAT.md "TRUE chord blocker"): a lock-bearing block
 # carries `01 00 00 00 <K> 00` at steps+0x29c and ends `..00 01` instead of `..01 00`.
@@ -111,6 +123,19 @@ def sustain_steps(sus_byte):
 # division-name -> ticks/step @96 PPQN (value * divisor = 384); see FORMAT.md table
 DIVISIONS = {1: 384, 2: 192, 4: 96, 8: 48, 16: 24, 32: 12, 64: 6,
              3: 128, 6: 64, 12: 32, 24: 16, 48: 8}
+
+
+def length_enum_from_spec(spec):
+    """Parse a --track-length value into the device's Length enum (backup-1). Accepts a bar count
+    ("1".."8","16"), a fraction ("1/2".."1/64"), or "inf"/"infinite"."""
+    s = str(spec).strip().lower()
+    if s in ("inf", "infinite"):
+        return 8
+    bars = (float(s.split("/")[0]) / float(s.split("/")[1])) if "/" in s else float(s)
+    for enum, b in F.LENGTH_BARS.items():
+        if b is not None and abs(b - bars) < 1e-9:
+            return enum
+    raise ValueError(f"--track-length {spec!r}: not a valid Length (1/64..8, 16 bars, or inf)")
 
 DEFAULT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "samples", "10_synth_test_import", "0.t1")
@@ -156,7 +181,8 @@ def _pitch_bytes(pitch_locks):
 def build_track_block(template, *, gate, pitches, steps, division, scale, root,
                       velocity, sustain, mask, pitch_locks, groove_locks, end_mark=1,
                       cycles=4, step_group=0, cycle_pitch=None, cycle_records=None,
-                      cycle_params=None):
+                      cycle_params=None, timing=None, delay=None, probability=None,
+                      length=None, timing_sub=None, free_division=None):
     """Synthesize one 803+ byte track block by cloning `template` stored-state and
     patching the controllable fields + variable-length pitch/lock/cycle regions.
 
@@ -214,6 +240,20 @@ def build_track_block(template, *, gate, pitches, steps, division, scale, root,
     sr[SR_ROOT] = root
     sr[SR_CYCLES] = cycles
     sr[SR_STEPGROUP] = step_group
+    # Backup-1 fields: patch only when explicitly given so a cloned template (roundtrip) keeps its
+    # own stored bytes byte-exact. Signed params (timing/delay/probability) are masked to a byte.
+    if timing is not None:
+        sr[SR_TIMING] = timing & 0xff
+    if delay is not None:
+        sr[SR_DELAY] = delay & 0xff
+    if probability is not None:
+        sr[SR_PROBABILITY] = probability & 0xff
+    if timing_sub is not None:
+        sr[SR_TIMING_SUB] = timing_sub
+    if length is not None:
+        sr[SR_LENGTH] = length
+    if free_division is not None:
+        sr[SR_FREEDIV] = 1 if free_division else 0
     # locks live in the base track OR any per-cycle record; both set the lock-summary/terminator.
     cyc_locks = any(g or p for _, _, g, p in cycle_records)
     has_locks = bool(pitch_locks or groove_locks or cyc_locks)
@@ -249,7 +289,7 @@ def build_track_block(template, *, gate, pitches, steps, division, scale, root,
 
 # ── bank (container) synthesis ──────────────────────────────────────────────────────
 def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
-               track_cursors=None, first_slots=None):
+               track_cursors=None, first_slots=None, tempo=120, pattern_quantize=None):
     """Assemble a per-bank `.t1` from a list of patterns (each a list of track-block bytes).
     Header: 05 "2.1.4" npat 00 tc0 00 00. Patterns separated by 12 B (8 B end-trailer
     `00 00 (tc-1) 00 00 00 00 00` + 4 B next-pattern header `slot tc 00 00`). Bank trailer:
@@ -283,6 +323,11 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
     # (byte 0) so contiguous-from-slot-1 banks stay byte-identical. See FORMAT.md / project3.zip.
     if first_slots is None:
         first_slots = [1] * npat
+    # `pattern_quantize` = each pattern's Quantize enum (trailer 4th byte; same enum as Length).
+    # Default 0 (= 1 bar) reproduces pre-decode output. `tempo` (u16 LE BPM) goes in the summary.
+    if pattern_quantize is None:
+        pattern_quantize = [0] * npat
+    tlo, thi = tempo & 0xff, (tempo >> 8) & 0xff
     cur = max(0, min(current_pattern, 15))
     if final_has_locks:                         # patch the bank's final lock terminator
         fb = bytearray(patterns[-1][-1])        # build_track_block left a 0x00 terminator here
@@ -303,11 +348,12 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
     out += bytes([npat, 0, len(patterns[0]), first_slots[0] - 1, 0])
     out += b"".join(patterns[0])
     for i in range(1, npat):
-        out += bytes([0, 0, track_cursors[i - 1], 0, 0, 0, 0, 0])  # end-of-prev-pattern trailer
+        # end-of-prev-pattern trailer: 00 00 <cursor> <quantize> 00 00 00 00
+        out += bytes([0, 0, track_cursors[i - 1], pattern_quantize[i - 1], 0, 0, 0, 0])
         out += bytes([indices[i], len(patterns[i]), first_slots[i] - 1, 0])  # next-pattern header
         out += b"".join(patterns[i])
-    out += bytes([0, 0, track_cursors[-1], 0, 0, 0, 0, 0])      # end-of-last-pattern trailer
-    out += bytes([0x78, 0, 0, 0, 0, cur, cur, 1, 0, 0, 0, cur])  # bank summary
+    out += bytes([0, 0, track_cursors[-1], pattern_quantize[-1], 0, 0, 0, 0])  # end-of-last trailer
+    out += bytes([tlo, thi, 0, 0, 0, cur, cur, 1, 0, 0, 0, cur])  # bank summary (bytes 0-1 = tempo)
     out += b"os|t"
     return bytes(out)
 
@@ -626,10 +672,13 @@ def _is_multibar(notes, ppqn, div, steps):
     return any(nt[0] >= window for nt in notes)
 
 
-def _voice_to_kwargs(notes, ppqn, div, length, cycles_mode, steps, cycle_count, channel=None):
+def _voice_to_kwargs(notes, ppqn, div, length, cycles_mode, steps, cycle_count, channel=None,
+                     timing=None, delay=None, track_length=None):
     """One voice's notes (with per-note channel) -> build_track_block kwargs (incl. mask), or
     None if no notes land on the grid. `channel` forces the output MIDI channel (else inferred).
-    `cycles_mode='auto'` resolves per-voice to 'bars' when the source is multi-bar, else single."""
+    `cycles_mode='auto'` resolves per-voice to 'bars' when the source is multi-bar, else single.
+    `timing`/`delay` (signed device values) and `track_length` (Length enum) are folded in when set
+    (backup-1)."""
     chan = channel or (_most_common([nt[4] for nt in notes], 1) if notes else 1)
     mode = cycles_mode
     if mode == "auto":
@@ -641,6 +690,12 @@ def _voice_to_kwargs(notes, ppqn, div, length, cycles_mode, steps, cycle_count, 
         if kw is None:
             return None
     kw["mask"] = 1 << (chan - 1)
+    if timing is not None:
+        kw["timing"] = timing
+    if delay is not None:
+        kw["delay"] = delay
+    if track_length is not None:
+        kw["length"] = track_length
     return kw
 
 
@@ -707,7 +762,8 @@ def assign_drum_slots(pitches, max_tracks=DRUM_MAX_TRACKS):
 
 
 def drum_split_entries(notes, ppqn, div, length, cycles_mode, steps, cycle_count, *,
-                       channel, max_tracks=DRUM_MAX_TRACKS):
+                       channel, max_tracks=DRUM_MAX_TRACKS, timing=None, delay=None,
+                       track_length=None):
     """Expand one drum voice into [(slot, build kwargs), ...] — one entry per drum track, placed at
     its assigned slot, all sharing `channel`. Single-pitch tracks come out lock-free.
 
@@ -726,7 +782,8 @@ def drum_split_entries(notes, ppqn, div, length, cycles_mode, steps, cycle_count
         ps = set(pset)
         sub = [n for n in notes if n[2] in ps]
         kw = _voice_to_kwargs(sub, ppqn, div, length, cycles_mode, steps, cycle_count,
-                              channel=channel)
+                              channel=channel, timing=timing, delay=delay,
+                              track_length=track_length)
         if kw is not None:
             entries.append((slot, kw))
     return entries
@@ -812,12 +869,13 @@ def write_backup_zip(bank_bytes, out_zip, slot=0, src_zip=None):
 
 # ── placement plan: which MIDI/voice -> which pattern/track (the "table") ─────────────
 # A plan is a dict:
-#   {"backup": "new"|"<real_backup.zip>", "bank": 0..7, "div": 16,
+#   {"backup": "new"|"<real_backup.zip>", "bank": 0..7, "div": 16, "tempo": 24..280,
 #    "patterns": [ {"slot": 0..15, "tracks": [ TRACKSPEC, ... ]}, ... ]}
 # TRACKSPEC = {"midi": path, "track": 1..16 (ABSOLUTE slot; empty slots between are skipped),
 #   (one source selector:) "smf_track": idx | "name": str | "channel": 1..16, "pitches": [..]
 #   (keep only these notes), (per-track opts, all optional:) "cycles": "bars", "steps": 1..64,
 #   "cycle_count": 1..16, "div": N, "length": 1..16, "out_channel": 1..16,
+#   "timing": signed, "delay": signed, "length_bars": "1"|"1/2"|..|"16"|"inf" (the Length field),
 #   "drum_split": true (explode this drum voice into one fixed-slot track per drum sound — ignores
 #   `track`; see assign_drum_slots), "max_drum_tracks": 1..8}
 # Front-ends below build this dict; run_plan() turns it into bank bytes. The FIRST serialized
@@ -865,6 +923,9 @@ def run_plan(plan, template):
             ppqn, smf = voices_of(ts["midi"])
             notes = _select_voice(smf, ts)
             div = ts.get("div", div_default)
+            # backup-1 per-track fields (optional): timing/delay raw signed, length_bars -> enum
+            tl = length_enum_from_spec(ts["length_bars"]) if ts.get("length_bars") else None
+            tm, dl = ts.get("timing"), ts.get("delay")
             if ts.get("drum_split"):                   # one drum voice -> many slot-fixed tracks
                 chan = ts.get("out_channel") or (_most_common([n[4] for n in notes], 1)
                                                   if notes else 1)
@@ -873,11 +934,13 @@ def run_plan(plan, template):
                 entries += drum_split_entries(
                     notes, ppqn, div, ts.get("length"), dcyc, ts.get("steps", 16),
                     ts.get("cycle_count"), channel=chan,
-                    max_tracks=ts.get("max_drum_tracks", DRUM_MAX_TRACKS))
+                    max_tracks=ts.get("max_drum_tracks", DRUM_MAX_TRACKS),
+                    timing=tm, delay=dl, track_length=tl)
                 continue
             kw = _voice_to_kwargs(notes, ppqn, div, ts.get("length"), ts.get("cycles"),
                                   ts.get("steps", 16), ts.get("cycle_count"),
-                                  channel=ts.get("out_channel"))
+                                  channel=ts.get("out_channel"), timing=tm, delay=dl,
+                                  track_length=tl)
             if kw is not None:
                 entries.append((ts.get("track", auto), kw))
         if not entries:
@@ -902,7 +965,8 @@ def run_plan(plan, template):
               "lower slots can't be left empty by the container")
         indices[0] = 0
     bank = build_bank(patterns_blocks, indices=indices, final_has_locks=final_has_locks,
-                      track_cursors=pattern_cursors, first_slots=first_slots)
+                      track_cursors=pattern_cursors, first_slots=first_slots,
+                      tempo=plan.get("tempo", 120))
     backup = plan.get("backup", "new")
     return bank, plan.get("bank", 0), (None if backup in (None, "new") else backup)
 
@@ -911,7 +975,8 @@ _PAT_RE = re.compile(r"pattern[_-]?(\d+)", re.I)
 _TRK_RE = re.compile(r"track[_-]?(\d+)", re.I)
 
 
-def plan_from_filenames(inputs, *, bank, backup, cycles_mode, steps, cycle_count, div, length):
+def plan_from_filenames(inputs, *, bank, backup, cycles_mode, steps, cycle_count, div, length,
+                        timing=None, delay=None, length_bars=None, tempo=120):
     """Derive a plan from filenames like `pattern1_track2.mid` (1-based pattern# -> slot pattern#-1;
     track# orders tracks within the pattern). Missing `patternN` -> pattern 1; missing `trackN` ->
     next free track in that pattern. Each file = ONE track sourced from its merged notes."""
@@ -926,13 +991,14 @@ def plan_from_filenames(inputs, *, bank, backup, cycles_mode, steps, cycle_count
             auto[p] = auto.get(p, 0) + 1; t = auto[p]
         by_pat.setdefault(p, []).append({
             "midi": path, "track": t, "cycles": cycles_mode, "steps": steps,
-            "cycle_count": cycle_count, "div": div, "length": length})
+            "cycle_count": cycle_count, "div": div, "length": length,
+            "timing": timing, "delay": delay, "length_bars": length_bars})
     patterns = [{"slot": p - 1, "tracks": tracks} for p, tracks in sorted(by_pat.items())]
-    return {"backup": backup, "bank": bank, "div": div, "patterns": patterns}
+    return {"backup": backup, "bank": bank, "div": div, "tempo": tempo, "patterns": patterns}
 
 
 def plan_per_file(inputs, *, bank, backup, split, cycles_mode, steps, cycle_count, div, length,
-                  drum_split=False):
+                  drum_split=False, timing=None, delay=None, length_bars=None, tempo=120):
     """Default front-end: each input `.mid` -> one pattern (contiguous slots from 0); within it,
     each SMF track (split) or MIDI channel -> one track. `drum_split` marks every voice as a drum
     part to be exploded into per-drum tracks on fixed slots (kick 16 ... clap 12, others below)."""
@@ -948,9 +1014,10 @@ def plan_per_file(inputs, *, bank, backup, split, cycles_mode, steps, cycle_coun
                 "channel": None if split else chan,
                 "drum_split": drum_split,
                 "cycles": cycles_mode, "steps": steps, "cycle_count": cycle_count,
-                "div": div, "length": length})
+                "div": div, "length": length,
+                "timing": timing, "delay": delay, "length_bars": length_bars})
         patterns.append({"slot": i, "tracks": tracks})
-    return {"backup": backup, "bank": bank, "div": div, "patterns": patterns}
+    return {"backup": backup, "bank": bank, "div": div, "tempo": tempo, "patterns": patterns}
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────────
@@ -970,6 +1037,10 @@ def main(argv):
     drum_split = False
     plan_path = None
     slot = 0
+    tempo = 120
+    timing = None
+    delay = None
+    track_length = None         # --track-length bar-spec; mapped to the Length enum
     inputs = []
     i = 0
     while i < len(args):
@@ -1005,6 +1076,14 @@ def main(argv):
             plan_path = args[i + 1]; i += 2
         elif a == "--slot":
             slot = int(args[i + 1]); i += 2
+        elif a == "--tempo":
+            tempo = int(args[i + 1]); i += 2
+        elif a == "--timing":
+            timing = int(args[i + 1]); i += 2
+        elif a == "--delay":
+            delay = int(args[i + 1]); i += 2
+        elif a == "--track-length":
+            track_length = args[i + 1]; i += 2
         elif a in ("-h", "--help"):
             print(__doc__); return 0
         elif a.startswith("-") and a not in ("-",):
@@ -1030,6 +1109,17 @@ def main(argv):
         print("--slot must be 0..7"); return 1
     if zip_src and new_backup:
         print("use either --zip (splice into a real backup) or --new-backup, not both"); return 1
+    if not (24 <= tempo <= 280):
+        print("--tempo must be 24..280 BPM"); return 1
+    if timing is not None and not (-127 <= timing <= 127):
+        print("--timing must be -127..127 (signed device value; exact unit scale TBD)"); return 1
+    if delay is not None and not (-127 <= delay <= 127):
+        print("--delay must be -127..127 (signed device value; exact unit scale TBD)"); return 1
+    if track_length is not None:
+        try:
+            length_enum_from_spec(track_length)
+        except ValueError as e:
+            print(e); return 1
 
     template = load_template(template_path)
 
@@ -1039,16 +1129,19 @@ def main(argv):
         import json
         plan = json.load(open(plan_path))
         plan.setdefault("bank", slot)
+        plan.setdefault("tempo", tempo)      # CLI --tempo is the default; plan may override
         if backup is not None:
             plan["backup"] = backup          # CLI overrides plan's backup choice
     elif by_filename:
         plan = plan_from_filenames(inputs, bank=slot, backup=backup, cycles_mode=cycles_mode,
-                                   steps=steps, cycle_count=cycle_count, div=div, length=length)
+                                   steps=steps, cycle_count=cycle_count, div=div, length=length,
+                                   timing=timing, delay=delay, length_bars=track_length, tempo=tempo)
     else:
         plan = plan_per_file(inputs[:16], bank=slot, backup=backup, split=split,
                              drum_split=drum_split,
                              cycles_mode=cycles_mode, steps=steps, cycle_count=cycle_count,
-                             div=div, length=length)
+                             div=div, length=length,
+                             timing=timing, delay=delay, length_bars=track_length, tempo=tempo)
 
     bank, bank_slot, backup_src = run_plan(plan, template)
     with open(out, "wb") as f:

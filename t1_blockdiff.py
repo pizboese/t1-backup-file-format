@@ -26,8 +26,10 @@ from t1_format import parse_bank, OFF_LOCKS, _parse_locks, TAIL_AFTER_STEPS
 # known field offsets relative to `steps` (for annotation)
 STEPS_FIELDS = {
     0x00: "steps", 0x2a: "division.lo", 0x2b: "division.hi", 0x40: "scale",
-    0x7b: "velocity", 0xa5: "sustain", 0xe4: "mask.lo", 0xe5: "mask.hi",
-    0x13f: "root",
+    0x79: "probability", 0x7b: "velocity", 0xa5: "sustain", 0xba: "timing",
+    0xe4: "mask.lo", 0xe5: "mask.hi", 0x13d: "style", 0x13e: "delay",
+    0x13f: "root", 0x146: "timing.sub", 0x14b: "length", 0x14d: "cycle_count",
+    0x299: "freediv.flag",
 }
 
 

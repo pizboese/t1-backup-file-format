@@ -179,6 +179,14 @@ edited cycle (cycle-index byte), P2 sweeps the parameter (id table: `00`=steps `
 two otherwise-identical 2-pattern banks differing only in the selected pattern — proved the saved
 **pattern cursor** lives solely in the 12-B bank summary. (Was `iteration10.zip`.)
 
+## 20_backup1_params/ — Timing/Delay/Probability/Length/Quantize/Free-div/Tempo sweep
+`backup1.zip`, the first "decode every remaining bit" campaign backup: one parameter per Pattern,
+the base track copied across 16 tracks with only the target laddered. Decoded **Timing**
+(`steps+0xba` s8, sub `+0x146`), **Delay** (`+0x13e` s8), **Probability** (`+0x79` s8), **Length**
+(`+0x14b` enum 0–15), **Free-division flag** (`+0x299`), **Quantize** (per-pattern trailer 4th byte),
+and **Tempo** (bank-summary bytes 0–1, u16 BPM — was the "constant `0x78`"). See the folder README
+and FORMAT.md "Backup-1 decode".
+
 ## device_settings/
 `Settings.json` and `Wifi.json` as found in a backup — global device configuration
 (MIDI routing, clock, CV, etc.), not part of the per-bank pattern data.
