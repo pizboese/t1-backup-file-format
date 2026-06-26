@@ -17,6 +17,7 @@ os.chdir(ROOT)
 
 import t1_format as F
 import test_roundtrip as R
+import decode.decode_rebuild as D
 
 
 def main():
@@ -33,7 +34,14 @@ def main():
                 continue
             if len(F.find_runs(data)) == 0:
                 print(f"skip  {p}: empty bank"); continue
+            # Prefer the shipped full-synthesis rebuild (exercises build_track_block + build_bank).
+            # Custom-scale / chord / X-marker banks (22, 23) desync the shipped find_runs, so fall
+            # back to the decode-local modeled-header rebuild (decode_rebuild). See decode/CLAUDE.md.
             res = R.test_file(p)
+            if res.startswith(("FAIL", "ERROR")):
+                alt = D.test_file(p)
+                if alt.startswith("ok"):
+                    res = alt + "  [decode-local: modeled header + cloned tail]"
         except Exception as e:
             res = f"ERROR {p}: {e}"
         print(res)

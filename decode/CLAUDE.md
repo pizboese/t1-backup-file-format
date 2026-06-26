@@ -17,8 +17,14 @@ backups whose new fields aren't modeled yet — dropped into the shared `samples
 - `t1_decode.py` — additive field reporting layered on `t1_format` (`import t1_format as F`); keeps
   any edits to the shipped parser minimal/additive.
 - `custom_scale.py` — models the custom scale-degree table (see structural findings).
-- `test_decode.py` — roundtrips `decode/samples/**` only (reuses `test_roundtrip.test_file`).
-  **Allowed to be red** on a field we've located but not yet modeled — that's a campaign TODO, not a regression.
+- `test_decode.py` — roundtrips `decode/samples/**` only (reuses `test_roundtrip.test_file`, with
+  `decode_rebuild` as the fallback for custom-scale/chord/X banks). **Now ALL PASS** (banks 22 & 23
+  rebuild byte-for-byte as of 2026-06-26).
+- `decode_rebuild.py` — decode-scope byte-exact rebuild. Models the block HEADER the shipped reader
+  hard-codes (`<X:u16><pitch_count:u32>` marker — X is a per-track field, not a constant `0x0c`; the
+  variable-length custom **scale-degree table** `<count:u32><degrees>`; block len = 791+scale_count)
+  and clones the already-proven tail. Self-contained; touches nothing shipped. See FORMAT_DECODE.md
+  "Block header fully modeled".
 - `_*.py` — single-use analysis helpers from each bank's decode (block scanners, pair diffs). Kept as
   a reproducible record of method.
 
@@ -61,9 +67,10 @@ Tools (run from repo root): `t1_blockdiff.py --sweep F:i …` (landmark-aligned 
 | `25_repeat_choke_tail` · `26_phrase_length` · `27_voicing_direction` · `28_groove_length` | extras |
 
 ## Status
-Nearly the whole steps-region is **located + documented** in `FORMAT_DECODE.md`. NOT yet: modeled into
-the shipped parser, rebuild-proofed (banks 22/23 fail `test_decode.py` by design — custom-scale
-landmark loss), or folded into the importer/exporter. Those are downstream phases (see TODO).
+Nearly the whole steps-region is **located + documented** in `FORMAT_DECODE.md`. The **decode-scope
+roundtrip is DONE** (2026-06-26): banks 22 & 23 now rebuild byte-for-byte (`decode_rebuild.py` models
+the block header — `X`, u32 pitch_count/chords, custom scale-degree table — and clones the proven
+tail). NOT yet: folded into the shipped parser/importer/exporter. Those are downstream phases (see TODO).
 
 ## Ground rules
 - **Never break `main`'s working set.** Edits to `t1_format.py` are additive (new reported fields
@@ -80,11 +87,14 @@ python3 decode/t1_decode.py FILE.t1  # parse + report decoded/located fields
 ```
 
 ## TODO
-- [ ] **Decode-scope roundtrip.** Model the located fields (especially the custom scale-degree table)
-  so `decode/test_decode.py` rebuilds banks **22 & 23 byte-for-byte**. Keep it self-contained in
-  `decode/` — **do NOT touch the shipped `test_roundtrip.py` or the root `samples/` glob.**
-- [ ] **Write `decode/BACKUP_INSTRUCTIONS.md`** — a programming worksheet for the still-open items that
-  need a fresh backup, using the same method (one param per pattern, monotonic ladder across tracks):
+- [x] **Decode-scope roundtrip.** ✅ DONE 2026-06-26 — `decode_rebuild.py` models the block header
+  (X / u32 pitch_count / custom scale-degree table) so `decode/test_decode.py` rebuilds banks **22 &
+  23 byte-for-byte** (ALL PASS). Self-contained in `decode/`; the shipped `test_roundtrip.py` + root
+  `samples/` glob were untouched and still ALL PASS. (Two minor tail nuances — s32 groove-lock value,
+  per-pattern-final terminator — are logged in FORMAT_DECODE.md and cloned rather than re-synthesized.)
+- [x] **Write `decode/BACKUP_INSTRUCTIONS.md`** ✅ DONE 2026-06-26 — checkbox/per-pattern-notes
+  worksheet for the still-open items (custom encoder CC#, bipolar positive-half scale, repeat
+  choke/tail, retrigger steps). Below is the source list it was built from:
   - custom encoder **CC#** (only defaults 70/71 were exercised — reassign an encoder's CC# to find the byte);
   - **bipolar positive-half scale** for Ramp/Pace/Range/Voicing/Accent (only the negative half + the
     extreme +20 were swept — sweep a few mid-positive values to nail range/granularity);

@@ -167,8 +167,9 @@ is right-anchored just below `run`.)
 Open/uncertain: (1) Accent/Range positive-half granularity (only −20…−6 and the +20 extreme seen,
 as in B21); (2) Harmony value byte at `run−0x10` not yet rebuild-proofed and its offset is
 header-relative (could shift with larger pitch lists); (3) the name of scale enum index 7 beyond
-“Custom/User”, and whether presets >6 exist on newer firmware; (4) custom-scale tracks break
-`find_runs` — the shipped parser cannot see them (documented, not fixed, per scope).
+“Custom/User”, and whether presets >6 exist on newer firmware; (4) ~~custom-scale tracks break
+`find_runs`~~ **RESOLVED 2026-06-26** — `decode/decode_rebuild.py` segments them via the scale-table
+anchor and the bank now rebuilds byte-for-byte in `decode/test_decode.py` (see the 2026-06-26 block-header entry).
 
 ### 2026-06-26 — Bank 23 (Modes + Routing + Global) decode
 Source: `decode/samples/23_modes_routing_global/23_modes_routing_global.t1` (project.zip bank 2).
@@ -224,7 +225,44 @@ Open/uncertain:
 - **P1 tracks 9–16 custom scales**: owner asked (2026-06-26) — **origin unknown / not recalled**, so
   treat as incidental pre-existing scale state (not part of the modes test). It is the actual reason
   this bank desyncs; the modes finding itself (`+0x154`) is unaffected.
-- None rebuild-proofed yet (located only; the bank does not roundtrip through the shipped parser).
+- ~~None rebuild-proofed yet~~ **RESOLVED 2026-06-26** — the bank rebuilds byte-for-byte via
+  `decode/decode_rebuild.py` (modeled block header + cloned tail); `decode/test_decode.py` ALL PASS.
+  The shipped `find_runs` still can't see the non-landmark blocks (left as-is, per scope).
+
+### 2026-06-26 — Block header fully modeled → banks 22 & 23 rebuild byte-for-byte ✅
+The decode-scope roundtrip (the standing TODO) is **done**. The blocker was never just the custom
+scale table — three header facts the shipped reader hard-codes had to be modeled together. Tool:
+`decode/decode_rebuild.py` (forward-walks the header, rebuilds it from fields, clones the
+already-understood tail); wired into `decode/test_decode.py` as a fallback when the shipped
+`test_roundtrip.test_file` desyncs. Root `test_roundtrip.py` stays **ALL PASS** (nothing shipped changed).
+
+**The block layout (start → gate), now fully resolved:**
+```
+<X:u16 LE> <pitch_count:u32 LE> <pitch_count pitch bytes>
+<cyc_pitch_count:u8> [ <cyc:u8><n:u32><n notes> ]*          per-cycle TRACK-pitch overrides
+<scale_count:u32 LE> <scale_count ascending semitone degrees>   the SCALE-DEGREE TABLE
+<64-byte gate> …                                            (tail unchanged from proven banks)
+```
+- **Block total length = 791 + scale_count** (chromatic 12 → 803). The scale degrees are the ONLY
+  variable-length contribution besides the pitch/lock lists.
+- **`X` = a per-track u16 at the block start (`run−0x0c`, the leading `0c` of the old "marker")** —
+  NOT a constant. Default 12; observed 4–9 on B23's CC/FX-mode tracks (blocks 0–4: X=7,4,8,5,9).
+  Semantics TBD (a CC/FX-mode config field?), but it must be preserved for a byte-exact rebuild.
+- **`pitch_count` is a u32**, so chords (B22 `[60,64,67]`) parse correctly; the shipped reader treats
+  it as 1 byte and the leading u16 as a literal `0c 00`, which is exactly why `find_runs` /
+  `_pitch_count_and_start` desync on B22 (chords) and B23 (X≠12) on top of custom scales.
+- **Scale-degree table** = `<count:u32><ascending degrees>` (confirms the B22 custom-scale finding);
+  modeled here so custom-scale blocks rebuild exactly.
+
+**Two tail nuances surfaced (logged, cloned rather than re-synthesized — minor codec width/ownership):**
+- A per-step **groove-lock VALUE is a signed int32**: Accent locks (id `0x18`) store e.g. −20 as
+  `ec ff ff ff`. The shipped lock codec keeps only the low u16 (+2 zero pad), fine for velocity/
+  sustain (0–127, high bytes 0) but lossy for bipolar Accent/Range step-locks.
+- A **per-pattern FINAL lock block's terminator byte = that pattern's `tc−1`** (container-owned by
+  `build_bank`), not the `0x00` that `build_track_block` writes for mid-pattern lock blocks.
+
+Verification: `python3 decode/decode_rebuild.py decode/samples/*/*.t1` → all 9 files `ok`;
+`python3 decode/test_decode.py` → **ALL PASS** (22 & 23 tagged `[decode-local: modeled header + cloned tail]`).
 
 ### 2026-06-26 — Bank 24 (Random behaviour) — full per-param random-control region
 
