@@ -1,0 +1,144 @@
+Bank 0:
+P1: as asked
+P2: pulses euclydian, otherwise as asked
+P3: as asked
+P4: values are not encode by 16 buttons but 7 buttons for coarse and 7 buttons for fine, Track 1: lowest, Track 2:lowest+1, Track 3:lowest+2 up until Track 15: lowest+14, Track 16: highest (i will call this valueCoarseFine, its used with other parameters too)
+P5: T1: 1/1, T2: 1/2, T3: 1/4, T4: 1/8, T5: 1/16, T6: 1/32, T7: 1/64, T8: 1/3, T9: 1/6, T10: 1/12, T11: 1/24, T12: 1/48, T13: free something low, T14: free less low, T15: free little higher, T16: free even higher
+P6: values are valueCoarseFine like above
+P7: values are valueCoarseFine
+P8:Tracks 1-8 as asked, Track 9 = CV input, Tracks 10-16 nothing, Phrase lenght = Bank 9, Pattern 1, Track 1-7
+P9: values are valueCoarseFine
+
+Bank 1:
+P1: valueCoarseFine
+P2: Track 1-8 as asked, Track 9 = CV Input, Tracks 10-16 nothing, Phrase length = Bank 11, Pattern 1, Track 1-7
+P3: i set pitch to C,E,G before tuning the parameter, otherwise as asked
+P4: Tracks 1-7: scales, Tracks 8-16 custom scales: 
+	T8: All notes
+	T9: C
+	T10: C,D
+	T11: C,D,E
+	T12: C,D,E,F
+	T13: All black keys
+	T14: All white keys
+	T15: C,E,G
+	T16: C,Cis,D,Dis,E
+P5: left out/empty since custom scales are in P4
+P6: as requested
+P7: as requested
+
+Bank 2:
+P1: as requested
+P2: on the device its not that every track has a specific CC number, there is 14 encoders with customizible CC numbers per track! they default to CC70 to CC83, in the pattern i did Tracks 1-8 (CC 70 sweep from 1/16 to 8/16) Tracks 9-16 CC 71 sweep from 1/16 to 8/16, we may need another backup where i set custom CCs for the encoders
+P3: as requested but on CC70
+P4: i believe FX tracks use exactly the same values as normal tracks, its basically enabling pitch coming from inputh rather then set on track, still its possible to set pitch by hand what if done. Tracks 1-4 have 4 euclidian pulses, Tracks 5-8 dont. All tracksw are FX tracks. pitch is set to 
+	T1: C
+	T2: C,D
+	T3: C,D,E
+	T4: D
+	T5: C
+	T6: C,D
+	T7: C,D,E
+	T8: D
+P5: routing is always enabled for to same as track number by default even when track is copied. Track 1 will always route to Track 1, Track2 to Track 2, since this is mandatory. Thus i varied routing differently:
+	T1: default
+	T2: default
+	T3: default
+	T4: default
+	T5: 1
+	T6: 2
+	T7: 3
+	T8: 4
+	T9: 1,2
+	T10: 1,2,3
+	T11: 1,2,3,4
+	T12: 1,2,3,4,5
+	T13: 8,16 
+	T14: 16
+	T15: 1,8,9,16
+	T16: 1
+P6: as requested
+P7: this is bipolar where left(negative) and right(positive) do have different behavior, for the sweep i did only positive 
+	T1: 0 (default)
+	T2: +1
+	T3: +2
+	..
+	T15: +14
+	T16: max
+P8: random rate is configured as division: T1: 1/1, T2: 1/2, T3: 1/4, T4: 1/8, T5: 1/16, T6: 1/32, T7: 1/64, T8: 1/3, T9: 1/6, T10: 1/12, T11: 1/24, T12: 1/48, Tracks 13-16: default
+
+I belive there are missing pices concrning random. Random itself has an intensity range per track defining the evolution of each tracks random sequence. this can be applied to each tracks parameter by increasing tracks parameters random value (as we did for velocity). the random fonction per tracks parameter can also be moved, locked (to stay independent of tracks global random intensity, meaning no evolution) and can be applied with a slew to make the random sequence more smooth. thus i provided another bank 3 with a variation of these parameters please look at https://docs.torsoelectronics.com/t1/parameter-reference/setup/random-rate again to understand random on the device):
+
+Bank 3:
+P1: Random intenity itself (not for specific parameter): sweeps trough 1716 to 16/16 on Tracks 1-16
+P2:  in this pattern i set random per parameter to left(negativ)minimum or right(positive)maximum, keep in mind that those bipolar values have different results for negative/positive
+	T1: Steps min
+	T2: Steps max
+	T3: Pulses min
+	T4: Pulses max
+	T5: Cycles min
+	T6: Cycles max
+	T7: Division min
+	T8: Division max
+	T9: Velocity min
+	T10: Velocity max
+	T11: Sustain min
+	T12: Sustain max
+	T13: Pitch min
+	T14: Pitch max
+	T15: Length min
+	T16: Length max
+P3:  same as P2 for the other aprameters
+	T1: Repeats min
+	T2: Repeats max
+	T3: Time min
+	T4: Time max
+	T5: Voicing min
+	T6: Voicing max
+	T7: Range min
+	T8: Range max
+	T9: Accent min
+	T10: Accent max
+	T11: Timing min
+	T12: Timing max
+	T13: Scale min
+	T14: Scale max
+	T15: Channel min
+	T16: Channel max
+P4:  in this track i locked the applied random for different parameters
+	T1: Steps locked
+	T2: Pulses locked
+	T3: random for Cycles not lockable (probably because it works on cycles not steps)
+	T4: Division locked
+	T5: Velocity locked
+	T6: Sustain locked
+	T7: Pitch locked
+	T8: Length not lockable (works on cycles also)
+P5: in this pattern i adjusted the phase of random sequence applied to steps (steps has random = max positive on all tracks)
+Tracks 1-8: sweep through random phase: 0, 1, 2, 3, 4, 5, 6, 7
+P6: in this pattern i applied slew on random sequence for steps (steps has random = max on all tracks)
+	T1: zero slew (default)
+	T2: little slew 
+	T3: more slew
+	T4: max slew
+
+I provide additional banks for settings i found not covered
+
+Extra:
+Bank  8:
+P1: Track 1: Repeat Choke Mode, Repeat Tail Mode
+Bank 9:
+P1: Track 1-7 (Phrase lenght): 1 bar,	2 bars,	4 bars (default),	8 bars,	16 bars,	32 bars,	64 bars
+Bank 10:
+P1: Track 1 (Voicing Options): Voicing Note Direction Up, Track 2: Voicing Note Direction Down
+Bank 11:
+P1: Tracks 1-7 (Groove length): 1 bar,	2 bars,	4 bars (default),	8 bars,	16 bars,	32 bars,	64 bars 
+
+
+in a second backup Project2.zip i did rotation with fixed steps as requested for Bank0, Pattern2, since i did it wrongly with euclydian ones there
+Bank 0:
+P1: rotating fixed steps
+
+Now there are still missing pieces we probably will need a backup for, jsut to mention them:
+- retrigger steps per track
+- custom midi CCs for encoders per track
