@@ -65,6 +65,7 @@ Tools (run from repo root): `t1_blockdiff.py --sweep F:i …` (landmark-aligned 
 | `23_modes_routing_global` | Note/CC/FX mode, CC encoders, internal routing, mute, FX |
 | `24_random` | Random intensity / amount / slew / lock / phase / rate |
 | `25_repeat_choke_tail` · `26_phrase_length` · `27_voicing_direction` · `28_groove_length` | extras |
+| `29_open_items` | CC#, bipolar positive-half scale, choke/tail, retrigger, selection cursor (B29) |
 
 ## Status
 Nearly the whole steps-region is **located + documented** in `FORMAT_DECODE.md`. The **decode-scope
@@ -92,13 +93,14 @@ python3 decode/t1_decode.py FILE.t1  # parse + report decoded/located fields
   23 byte-for-byte** (ALL PASS). Self-contained in `decode/`; the shipped `test_roundtrip.py` + root
   `samples/` glob were untouched and still ALL PASS. (Two minor tail nuances — s32 groove-lock value,
   per-pattern-final terminator — are logged in FORMAT_DECODE.md and cloned rather than re-synthesized.)
-- [x] **Write `decode/BACKUP_INSTRUCTIONS.md`** ✅ DONE 2026-06-26 — checkbox/per-pattern-notes
-  worksheet for the still-open items (custom encoder CC#, bipolar positive-half scale, repeat
-  choke/tail, retrigger steps). Below is the source list it was built from:
-  - custom encoder **CC#** (only defaults 70/71 were exercised — reassign an encoder's CC# to find the byte);
-  - **bipolar positive-half scale** for Ramp/Pace/Range/Voicing/Accent (only the negative half + the
-    extreme +20 were swept — sweep a few mid-positive values to nail range/granularity);
-  - **repeat choke/tail** semantics (one byte `+0x14a`, two modes not yet separated);
-  - **retrigger steps** per track (not yet exercised at all).
+- [x] **Decode the four open items** ✅ DONE 2026-06-26 (B29 = `samples/29_open_items`, `project.zip`
+  bank 0; rebuilds byte-for-byte via `decode_rebuild`, `decode/test_decode.py` ALL PASS). All four
+  closed + a bonus selection-cursor finding (see FORMAT_DECODE.md "Bank 29"):
+  - custom encoder **CC#** = `steps+0x16a`+0x17·N (literal CC byte, one before the enable flag; def 70+N);
+  - **bipolar scale** = linear s8, **1 unit/notch, centre 0, symmetric −20…+20** (Ramp/Pace/Range/Voicing/Accent all confirmed);
+  - **repeat end-behaviour** `steps+0x14a` = enum **0=Tail / 1=Choke** (mutually exclusive, not a bitfield);
+  - **retrigger** = per-step gate-byte **bit `0x04`** (`run+0x0c`+step), not a track value;
+  - **(bonus) track selection cursor** = selected 0-based track indices in the per-pattern trailer at `last_block_end+2`.
+- [x] **Write `decode/BACKUP_INSTRUCTIONS.md`** ✅ DONE 2026-06-26 — the worksheet that drove B29 above.
 - [ ] (later) Fold confirmed fields into the shipped `t1_format.py` / `midi_to_t1.py` / `t1_to_midi.py`
   + canonical `FORMAT.md`, each with byte-exact roundtrip proof.

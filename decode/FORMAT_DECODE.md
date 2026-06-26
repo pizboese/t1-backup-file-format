@@ -19,13 +19,14 @@ Offsets are relative to the `steps` field unless noted. `(B1)` = decoded in back
 | Cycles | 1–16, def 4 | ✅ `steps+0x14d`; per-cycle engine decoded |
 | Division | note values; Free | ✅ `steps+0x2a` u16 + free-flag `steps+0x299` (B1) |
 | Repeats | 0–48 (+∞) | 🟡 `steps+0xfa` u8 (stored repeats+1) — located B21 |
-| Ramp | directional | 🟡 `steps+0x13b` s8 bipolar — located B21 (scale provisional) |
+| Ramp | bipolar ±20 | ✅ `steps+0x13b` s8 — scale CONFIRMED B29 (1 unit/notch, centre 0) |
+| Retrigger (per-step) | per-step flag | ✅ gate-byte **bit `0x04`** (`run+0x0c`+step); 2=gate,4=retrig,6=both (B29) |
 | Time (repeat spacing) | note values | 🟡 `steps+0x124` u16 + free-flag `steps+0x29a` — located B21 |
-| Pace | bipolar | 🟡 `steps+0x13c` s8 — located B21 (scale provisional) |
-| Voicing (amount) | continuous | 🟡 `steps+0xcf` s8 — located B21 (distinct from Style) |
+| Pace | bipolar ±20 | ✅ `steps+0x13c` s8 — scale CONFIRMED B29 (1 unit/notch) |
+| Voicing (amount) | bipolar ±20 | ✅ `steps+0xcf` s8 — scale CONFIRMED B29 (distinct from Style) |
 | Voicing (note direction) | Up / Down | 🟡 `steps+0x149` u8 0=Up/1=Down — located B27 (2-block) |
 | Style | poly 0–4 / mono 8–12 | ✅ `steps+0x13d` |
-| Range | amount | 🟡 `steps+0x90` s8 — located B21 (1 noise collision) |
+| Range | bipolar ±20 | ✅ `steps+0x90` s8 — scale CONFIRMED B29 (1 unit/notch; 1 noise collision) |
 | Phrase (shape+length) | 8 shapes; 1–64 bars | 🟡 shape `steps+0x147` enum (0–7 shapes, 8=CV-in) — located B21; length `steps+0x144` enum `v→2^(6−v)` bars (B26) |
 
 ### Groove
@@ -36,8 +37,9 @@ Offsets are relative to the `steps` field unless noted. `(B1)` = decoded in back
 | Sustain (track+step) | 0–127, def 64 | ✅ `steps+0xa5`; lock id `0x0e`; log law |
 | Timing (swing) | bipolar, x1/x2/x4 | ✅ amount `steps+0xba` s8; sub `+0x146` (B1) |
 | Delay | bipolar | ✅ `steps+0x13e` s8 (B1) |
-| Accent (amount) | bipolar | ✅ track `steps+0x10f` s8 ±20; step-lock id `0x18` (B22) |
+| Accent (amount) | bipolar ±20 | ✅ track `steps+0x10f` s8; scale CONFIRMED B29 (1 unit/notch); step-lock id `0x18` (B22) |
 | Groove (pattern+length) | 8 patterns; 1–64 bars | 🟡 pattern `steps+0x148` enum (0–7, 8=CV-in) (B22); length `steps+0x145` enum `v→2^(6−v)` bars (B28) |
+| Repeat end-behaviour | Tail / Choke | ✅ `steps+0x14a` u8 enum: **0=Tail, 1=Choke** (mutually exclusive; B29) |
 
 ### Tonal
 | Feature | Range | Status |
@@ -55,6 +57,7 @@ Offsets are relative to the `steps` field unless noted. `(B1)` = decoded in back
 | Channel | 1–16 | ✅ out-mask `steps+0xe4` |
 | Output (internal routing) | per-track 16-track bitmask | ✅ `steps+0x297` u16 LE, bit i = route to track i+1 (B23) |
 | Tempo (per-bank) | 24–280, def 120 | ✅ bank summary bytes 0–1 u16 LE (B1) |
+| Track selection cursor (per-pattern) | set of selected tracks | 🟡 selected 0-based track indices in per-pattern trailer at `last_block_end+2…` (B29) |
 | Random intensity (per-track) | 1/16–16/16 | ✅ `steps+0x140` u8, LED N×8 scale 0–127 (B24) |
 | Random amount (per-param) | ±20 bipolar | ✅ s8 at `value+0x12` for each sequenced param — full 16-param map (B24) |
 | Random slew (per-param) | 0–~127 | ✅ u8 at `amount+1` (= `value+0x13`); Steps measured 0/1/21/78 (B24) |
@@ -67,7 +70,7 @@ Offsets are relative to the `steps` field unless noted. `(B1)` = decoded in back
 |---|---|
 | Track Mode Note/CC/FX | ✅ `steps+0x154` u8 enum 0=Note/1=CC/2=FX (B23) |
 | CC encoder value | ✅ `steps+0x155` + 0x17·N (14 encoders, def 100); per-step lock id `0x80` (B23) |
-| CC encoder select (=CC#) | 🟡 enable flag `steps+0x16b`+0x17·N; default CC#=70+N; custom CC# not in B23 |
+| CC encoder CC# | ✅ `steps+0x16a` + 0x17·N u8 (literal CC number; one byte before enable `+0x16b`); default 70+N (B29) |
 | FX config | ✅ none — identical to Note block, only mode=2 (B23) |
 | Mute / enable | ✅ mute flag `run−0x0d` (block-header byte before pitch marker): 1=muted (B23) |
 
@@ -88,6 +91,7 @@ full per-param amount-offset map.
 | 4 | Modes + Routing + Global | Note/CC/FX mode, CC#/value, FX, Output routing, Mute, Random amt/Rate | `samples/23_modes_routing_global` | ✅ located (B23) |
 | 5 | Random behaviour | Random intensity/amount/slew/lock/phase/rate (16-param map) | `samples/24_random` | ✅ located (B24) |
 | 6 | Extras | Phrase-len, Groove-len, Voicing-dir, Repeat choke/tail | `samples/25–28_*` | ✅ located (B25–28) |
+| 7 | Open items | CC#, bipolar positive-half scale, choke/tail semantics, retrigger, selection cursor | `samples/29_open_items` | ✅ all 4 decoded (B29); rebuilds byte-for-byte |
 
 ## Per-field decode log
 (Append a dated entry per field as it flips to ✅: offset, kind, how isolated, sample, rebuild proof.)
@@ -385,3 +389,33 @@ Caveats:
 - **Bar-length enum** is inverted/descending (`v → 2^(6−v)`): larger stored value = shorter phrase.
   Range observed 0–6; values >6 (if any longer settings exist) not sampled. Default for both = `4` (4 bars).
 - None rebuild-proofed through the shipped parser (located only; consistent with B21–B24 status).
+
+### 2026-06-26 — Bank 29 (Open items) — CC#, bipolar positive half, choke/tail, retrigger ✅
+Source: `decode/samples/29_open_items/29_open_items.t1` (`project.zip` bank 0; the only programmed
+bank). 11 patterns × (mostly) 16 contiguous tracks = 164 serialized blocks; **P n = blocks
+16·(n−1)…** except P7 has 4 blocks (96–99), shifting P8=100–115, P9=116–131, P10=132–147,
+P11=148–163. `find_runs` sees all 164 (no custom-scale/chord desync). Method: `decode/_scan_mono.py`
++ direct steps-relative ladder search + run-relative cross-block diff. Owner's per-pattern notes in
+`decode/BACKUP_INSTRUCTIONS.md` (read first — they give the real ladders, incl. the centre→+ sweeps
+that jumped straight to max on T16, and the retrigger-is-per-step clarification).
+
+| Item | Offset / encoding | Kind | Evidence | Confidence |
+|---|---|---|---|---|
+| **CC encoder CC#** | `steps+0x16a` + `0x17`·N | u8 | P1 (enc0 CC# laddered 64→79) blk0–15 = `64,65,…,76,67,78,79` (T14=67 is a user slip/noise; rest a perfect +1 ladder). Sits **one byte before** the encoder enable flag `+0x16b`; same `0x17` stride as the value array `+0x155`. Default = 70+N (matches B23). The CC# is a **separate literal byte**, not a remap of the enable flag | **high** |
+| **Bipolar positive scale** (Ramp/Pace/Range/Voicing/Accent) | `+0x13b / +0x13c / +0x90 / +0xcf / +0x10f` | s8 | P2–P6 each = `0,1,2,…,14, 20`: a clean **1-unit-per-notch** positive ramp from centre 0, then T16 jumps to the **+20 extreme** (max), exactly per the owner's "did not reach max, jumped T15→T16" note. P4 Range T8=14 is the known noise collision. ⇒ the s8 is **linear, symmetric −20…+20, centre 0, one stored unit per LED notch** — upgrades all five from "scale provisional" to confirmed | **high** |
+| **Repeat end-behaviour** (choke/tail) | `steps+0x14a` | u8 enum | P7 blk96–99 = `[0,0,1,1]` with Repeats fixed at 5(=4+1). Owner: T1&2 = **Tail**, T3&4 = **Choke**, and the two are **mutually exclusive** (XOR — never both, never neither). ⇒ single enum: **0=Tail, 1=Choke** (NOT a bitfield). Resolves the B25 ambiguity (B25 blk0=0=Tail, blk1=1=Choke). Only other P7 diff = positional end-marker `+0x2b5` | **high** |
+| **Retrigger (per-step)** | gate byte **bit `0x04`** at `run+0x0c`+step | per-step flag | P8 blk100–115. Retrigger is **not a track value** — it is a per-step flag OR'd into the existing 64-byte gate array. Each step byte = `(gate?2:0) | (retrig?4:0)`: inactive step=`0`, active=`2`, inactive+retrig=`4`, active+retrig=`6`. T1–8 placed a single retrig that lit `0x04` on one step each (e.g. T2 step2: byte `0→4`; T5 step5(active): byte `2→6`); T10–16 lit an increasing contiguous run of `0x04` bits. No length change, no new offset | **high** |
+| **Track selection cursor** (per-pattern) | per-pattern trailer at `last_block_end + 2…` | list of u8 track indices | P9/P10/P11 selected tracks 1–4 / 5–8 / 9–12. The 27-byte inter-pattern trailer holds the **set of selected 0-based track indices** at offset +2: P9=`03 00 01 02`={0,1,2,3}, P10=`04 06 05 07`={4,5,6,7}, P11=`0b 09 08 0a`={8,9,10,11} — each set matches the programmed selection exactly (stored in selection/cursor order, not sorted). This is the field the shipped builder under-emits (its trailer is 9 B shorter → the lone shipped-roundtrip diff at P9 `0x19e99` = trailer+2) | medium (offsets clean; the variable-length count/order encoding only sampled at count=4) |
+
+**Roundtrip.** The shipped `test_roundtrip.test_file` fails on this bank (rebuilt bank 9 B short at
+`0x19e99` — the multi-track selection cursor it doesn't model). `decode/decode_rebuild.py` rebuilds
+it **byte-for-byte** (132 blocks, 131888 B) by cloning the proven tail, so `decode/test_decode.py`
+is **ALL PASS** and the shipped `test_roundtrip.py` stays untouched and green.
+
+Open/uncertain:
+- **CC# T14=67**: a single off-ladder reading (expected 77) — owner slip or noise, not a special case.
+- **Selection cursor**: only count=4 sampled; the list's length prefix / max count / exact slot
+  order (it is not sorted — appears to be cursor/selection order with the anchor first) are unconfirmed.
+  A default (single-track) selection trailer was not isolated here.
+- **Retrigger semantics**: confirmed as the gate-byte `0x04` flag; what the device *does* with it
+  (re-roll random/accent/groove per the owner's note) is behaviour, not a separate stored field.
