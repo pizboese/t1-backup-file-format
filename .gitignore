@@ -9,3 +9,6 @@ __pycache__/
 
 # scratch MIDI working dir
 midi/
+
+# Claude chat transcript exports
+decode/chat-*.txt

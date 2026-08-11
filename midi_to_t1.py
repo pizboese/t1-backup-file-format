@@ -99,7 +99,14 @@ GATE_LEN = F.GATE_LEN                  # 64: full gate array (steps 1-64)
 
 PARAM_VELOCITY = 0x0a
 PARAM_SUSTAIN = 0x0e
-GROOVE_PARAM_CODE = {"velocity": PARAM_VELOCITY, "sustain": PARAM_SUSTAIN}
+PARAM_RANGE = 0x0c                     # per-step Range lock (bipolar s8 ±20, stored s32)
+PARAM_ACCENT = 0x18                    # per-step Accent lock (bipolar s8 ±20, stored s32)
+PARAM_CC = 0x80                        # per-step CC-value lock (0-127; track must be in CC mode)
+GROOVE_PARAM_CODE = {"velocity": PARAM_VELOCITY, "sustain": PARAM_SUSTAIN,
+                     "range": PARAM_RANGE, "accent": PARAM_ACCENT, "cc": PARAM_CC}
+# Bipolar lock IDs need s32 sign-extension. The shipped parser reads val as u8 so the dict it
+# returns shows e.g. 236 for −20; pass that back through this encoder and the s32 reinterprets it.
+BIPOLAR_LOCK_IDS = {PARAM_RANGE, PARAM_ACCENT}
 
 # ── Sustain law (hardware-confirmed) ─────────────────────────────────────────────────
 # Note length is EXPONENTIAL in the stored byte: it DOUBLES every 16 byte units (every 2 of
@@ -157,15 +164,23 @@ def load_template(path):
 
 # ── lock-list serialization (shared by base track AND per-cycle records) ──────────────
 def _groove_bytes(groove_locks):
-    """Serialize a groove-lock list. `groove_locks` = {step0: {'velocity'|'sustain': value}}
-    or {step0: {param_id:int: value}} (raw). Newest/step-desc first; one record per step packs
-    all its params: [entry_count][step] then N*[param][value:u16 LE][00 00]."""
+    """Serialize a groove-lock list. `groove_locks` = {step0: {'velocity'|'sustain'|'accent'|
+    'range'|'cc': value}} or {step0: {param_id:int: value}} (raw). Newest/step-desc first; one
+    record per step packs all its params: [entry_count][step] then N*[param][value:int32 LE].
+
+    Value is **signed int32 LE** (5-byte record total). For 0..127 (vel/sus/CC) this is
+    byte-identical to the historical `u16 + 00 00` encoding. For bipolar lock IDs
+    (`BIPOLAR_LOCK_IDS` = Accent/Range, ±20) the s32 sign-extends, matching device storage.
+    The shipped parser reads val as u8 so it reports e.g. 236 for −20 — passing that 236 back
+    here against a bipolar pid wraps it to −20 first, so parser→encoder roundtrips byte-exact."""
     out = bytearray([len(groove_locks)])
     for step, gl in sorted(groove_locks.items(), reverse=True):
         out += bytes([len(gl), step])
         for name, value in gl.items():
             pid = name if isinstance(name, int) else GROOVE_PARAM_CODE[name]
-            out += bytes([pid]) + struct.pack("<H", value) + b"\x00\x00"
+            if pid in BIPOLAR_LOCK_IDS and 128 <= value <= 255:
+                value -= 256                  # parser returned u8 of an s8-stored bipolar value
+            out += bytes([pid]) + value.to_bytes(4, "little", signed=(value < 0))
     return bytes(out)
 
 
@@ -311,11 +326,15 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
     npat = len(patterns)
     if indices is None:
         indices = list(range(npat))
-    # `track_cursors` = the per-pattern saved "current track" cursor (0-based) that goes in each
-    # pattern's end-trailer (offset +2). UI state — the track the device opens that pattern on;
-    # CAN exceed the serialized track count (e.g. cursor parked on an empty track). Defaults to
-    # the last serialized track. (This byte was historically read as `prev_tc-1`; that held only
-    # because the cursor sat on the last track. See FORMAT.md.)
+    # `track_cursors` = per-pattern saved "current track" selection that goes in each pattern's
+    # end-trailer (offset +2). UI state — what the device opens that pattern on. Two accepted
+    # forms per pattern entry:
+    #   - int N → single selection (legacy, 8-B trailer `00 00 N Q 00 00 00 00`).
+    #   - list[int] → multi-track selection SET in selection/cursor order (variable-length
+    #     trailer `00 00 N0 N1 … Q 00 00 00 00`; e.g. 4 selections → 11 B).
+    # Either form CAN exceed the serialized track count (cursor parked on an empty track).
+    # Defaults to the last serialized track. (Historical read of `prev_tc-1` held only because
+    # the cursor happened to sit on the last track. See FORMAT.md / FORMAT_DECODE B23.)
     if track_cursors is None:
         track_cursors = [len(p) - 1 for p in patterns]
     # `first_slots` = each pattern's FIRST serialized track's 1-based slot. Stored as slot-1 in
@@ -344,15 +363,17 @@ def build_bank(patterns, current_pattern=0, indices=None, final_has_locks=False,
                 fb += b"\x00"                    #   + one pad byte (multi-pattern Form X only)
         # Form Y (marker already at the region end-byte): leave terminator 0, no pad.
         patterns[-1][-1] = bytes(fb)
+    def _pat_trailer(cur, quant):
+        sel = [cur] if isinstance(cur, int) else list(cur)
+        return bytes([0, 0]) + bytes(sel) + bytes([quant, 0, 0, 0, 0])
     out = bytearray(b"\x052.1.4")
     out += bytes([npat, 0, len(patterns[0]), first_slots[0] - 1, 0])
     out += b"".join(patterns[0])
     for i in range(1, npat):
-        # end-of-prev-pattern trailer: 00 00 <cursor> <quantize> 00 00 00 00
-        out += bytes([0, 0, track_cursors[i - 1], pattern_quantize[i - 1], 0, 0, 0, 0])
+        out += _pat_trailer(track_cursors[i - 1], pattern_quantize[i - 1])
         out += bytes([indices[i], len(patterns[i]), first_slots[i] - 1, 0])  # next-pattern header
         out += b"".join(patterns[i])
-    out += bytes([0, 0, track_cursors[-1], pattern_quantize[-1], 0, 0, 0, 0])  # end-of-last trailer
+    out += _pat_trailer(track_cursors[-1], pattern_quantize[-1])     # end-of-last trailer
     out += bytes([tlo, thi, 0, 0, 0, cur, cur, 1, 0, 0, 0, cur])  # bank summary (bytes 0-1 = tempo)
     out += b"os|t"
     return bytes(out)

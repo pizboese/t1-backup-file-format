@@ -82,7 +82,10 @@ def _parse_lock_list_raw(data, p):
         ec, step = data[p], data[p + 1]; p += 2
         d = {}
         for _ in range(ec):
-            pid = data[p]; val = int.from_bytes(data[p + 1:p + 3], "little")
+            # Value is signed int32 LE (5 bytes total incl. pid). Bipolar lock IDs (Accent 0x18,
+            # Range 0x0c, perhaps Timing TBD) store negative values sign-extended; unipolar IDs
+            # (vel/sustain/CC) sit in 0..127 so signed read is a no-op for them.
+            pid = data[p]; val = int.from_bytes(data[p + 1:p + 5], "little", signed=True)
             d[pid] = val; p += 5
         groove[step] = d
     pitch = {}
