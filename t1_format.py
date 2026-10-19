@@ -241,8 +241,12 @@ def group_patterns(tracks):
 
 def parse_bank(path):
     data = open(path, "rb").read()
-    if data[:6] != b"\x052.1.4":
-        raise ValueError(f"{path}: not a 2.1.4 .t1 file (got {data[:6]!r})")
+    if len(data) < 10 or data[-4:] != b"os|t":
+        raise ValueError(f"{path}: missing or invalid 'os|t' integrity tag")
+    vlen = data[0]
+    vstr = data[1:1+vlen].decode("ascii", errors="replace")
+    if not (vstr.startswith("2.1.") or vstr.startswith("2.")):
+        raise ValueError(f"{path}: unsupported firmware version {vstr!r} (expected 2.1.x)")
     runs = find_runs(data)
     # pass each block's upper bound (next block start) so cycle-bearing blocks can anchor
     # `steps` off the Zone-B terminator instead of the (shifted) forward lock walk.
@@ -273,7 +277,7 @@ def parse_bank(path):
         else:
             q_off = len(data) - 16 - 8 + 3                        # final trailer before summary
         quantize.append(data[q_off])
-    return {"path": path, "size": len(data), "version": "2.1.4", "tempo": tempo,
+    return {"path": path, "size": len(data), "version": vstr, "tempo": tempo,
             "tracks": tracks, "patterns": patterns, "quantize": quantize}
 
 

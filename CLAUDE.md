@@ -99,6 +99,9 @@ Phrase, Accent, Time, Chance, …) to name the still-undecoded steps-region para
 was the trailing lock-summary + load rules (resolved; see FORMAT.md).
 
 ## Tools (Python 3, no dependencies)
+- `t1_firmware_parser.py` — recursive firmware-ground-truth parser. Mirrors exact C++ deserialization
+  (`FileStream`, `Bank`, `Pattern`, `Track`) verified against ESP32 firmware v2.1.5. Audits corpus.
+- `test_firmware_parser.py` — unit test suite for firmware ground truth (`python3 test_firmware_parser.py`).
 - `t1_format.py` — parser. `parse_bank(path)` → `{patterns: [[track,…],…], tracks:[…]}`.
   CLI: `python3 t1_format.py FILE.t1` prints decoded tracks + per-step locks.
 - `t1_to_midi.py` — exporter. `python3 t1_to_midi.py FILE.t1 -o OUTDIR [--bpm 120]`

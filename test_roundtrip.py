@@ -111,7 +111,7 @@ def main():
     for p in paths:
         try:
             data = open(p, "rb").read()
-            if data[:6] != b"\x052.1.4":
+            if not (data[:6] == b"\x052.1.4" or data[:6] == b"\x052.1.5"):
                 continue
             if len(F.find_runs(data)) == 0:
                 print(f"skip  {p}: empty bank"); continue

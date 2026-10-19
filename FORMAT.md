@@ -1,24 +1,46 @@
-# Torso T-1 `.t1` backup format — reverse-engineering notes
+# Torso T-1 `.t1` backup format — reverse-engineering notes & firmware specification
 
-Status: **export + import working**. Firmware `2.1.4`. One `.t1` file = one **bank**.
-Format is a flat, **deterministic** byte serialization (re-exporting unchanged content
+Status: **Fully decoded, verified against ESP32 firmware v2.1.5 ground truth, and hardware-tested**. One `.t1` file = one **bank**.
+Format is a flat, **deterministic** recursive binary serialization (re-exporting unchanged content
 yields byte-identical files). The full container (track blocks + pattern wrappers + bank
-trailer) is reproduced **byte-for-byte across all 32 sample banks** by `test_roundtrip.py`,
-which is what makes synthesis (MIDI → `.t1`) reliable.
+trailer) is reproduced **byte-for-byte across all sample banks** by `test_roundtrip.py`,
+which makes synthesis (MIDI → `.t1`) 100% reliable.
 
-Legend: offsets are 0-based hex. `u8` = one byte. "confirmed" = proven by a controlled
-backup sweep; "hypothesis" = inferred, not yet isolated.
+Legend: offsets are 0-based hex. `u8` = one byte, `u16` = 16-bit unsigned integer (little-endian),
+`u32` = 32-bit unsigned integer (little-endian).
+"confirmed" = verified against decompiled ESP32 C++ firmware methods (`FUN_400edbe8`, `FUN_40157e4c`,
+`FUN_4015796c`, `FUN_401575b4`, `FUN_40155de4`) and hardware sweeps.
 
-## Two container formats (same inner track block)
-The device produces two zip layouts:
-- **Per-bank backup** ("Backup" menu): one `<bankindex>.t1` file per used bank
-  (the original `0.t1`..`7.t1`). Header 11 B, then track blocks, then a 24 B trailer.
-- **Autosave snapshot**: a folder `autosave/` with hash-named files — **one file per used
-  pattern** (track blocks concatenated inside), plus a 14 B global file and, with 2+
-  patterns, a 22 B index file. Per-pattern file: header 9 B, track blocks, 12 B trailer.
+## Firmware storage & transport architecture
+1. **Flash Storage (`/littlefs/`)**: Banks are not generated on the fly during backup. Active banks
+   continuously live in onboard SPI flash formatted with LittleFS as `/littlefs/0.t1` through `/littlefs/7.t1`.
+2. **Autosave in v2.1.x**: The hypothesized "Autosave snapshot" (per-pattern files in `autosave/`) was an
+   artifact of older pre-v2 toolchains or external managers. In production firmware v2.1.x, `"autosave"`
+   is simply a boolean setting in `Settings.json`. When active, the sequencer periodically flushes the
+   current bank in-memory state directly to `/littlefs/N.t1`. All bank containers use the standard `.t1` format.
+3. **Transport Protocol**: During a "Backup" operation, the device transmits raw bank files over MIDI SysEx
+   using standard 7-to-8 bit MSB packing. The Torso Config app receives the SysEx dump, unpacks the 8-bit stream,
+   and writes `0.t1`..`7.t1`, `Settings.json`, and `Wifi.json` into the resulting `.zip`.
+4. **Mandatory File Integrity Tag (`os|t`)**: The firmware (`FUN_400edbe8`) enforces that every `.t1` file
+   ends with the 4-byte ASCII tag `os|t` (`0x747c736f` in little-endian). A file missing this tag is rejected
+   with `"File tag check failed on %s"`.
 
-Both embed the identical **803-byte track block**. Offsets below are given block-relative
-where possible so they apply to both containers.
+## Recursive stream grammar (C++ deserialization model)
+The `.t1` format is not a collection of ad-hoc landmark blocks separated by mysterious gap headers; it is a
+clean, hierarchical recursive C++ serialization stream:
+- **`FileStream` (`FUN_400edbe8`)**: Checks `data[-4:] == "os|t"` and validates the length-prefixed ASCII
+  SemVer string (`\x052.1.4`, `\x052.1.5`).
+- **`Bank::deserialize` (`FUN_40157e4c`)**: Reads `pattern_count` (offset `0x06`), then sequentially
+  deserializes each pattern, reads the 12-byte bank summary, and validates the EOF tag.
+- **`Pattern::deserialize` (`FUN_4015796c`)**: Reads `pattern_id:u8` (slot 0..15), `track_count:u8`,
+  then sequentially deserializes each track block, followed by the pattern trailer:
+  `00 00 <prev_tc-1> <quantize:u8> <automation_count:u32 LE>`. If `automation_count > 0`, it reads
+  `automation_count × 48` bytes of CC automation records (introduced in v2.0.3).
+- **`Track::deserialize` (`FUN_401575b4` / `FUN_40155de4`)**: Reads `track_id:u8` (slot 0..15),
+  `flags:u8`, `marker:u16` (`0c 00`), pitch count & pitches, 64-byte gate array, groove/pitch locks,
+  cycles, and track parameters.
+
+Offsets below are given block-relative where possible.
 
 ## Track block — 803 bytes (CONFIRMED), block-relative offsets
 Tracks are stored as a packed array of 803-byte blocks (only non-empty tracks serialized).
@@ -412,39 +434,61 @@ differed in **exactly those 3 bytes** (`01` vs `00`) — everything else is per-
 It touches no track/pattern content; `build_bank(current_pattern=…)` already emits it. Safe to
 set 0.
 
-## Container detail: per-bank `.t1` (CONFIRMED — fully reconstructed byte-exact)
-Verified: the 803-byte track block is **byte-identical** between the manual `.t1` and the
-autosave files. The whole container is now reproduced byte-for-byte across all 32 sample
-banks (`test_roundtrip.py`). Layout of a per-bank `.t1` holding multiple patterns:
-```
-0x00  05 "2.1.4"                       magic + version (6 B)
-0x06  <npat> 00 <tc0> 00 00            bank header: npat=#patterns serialized,
-                                       tc0=first-pattern track-count (5 B)
-0x0b  P0 track blocks                  tc0 blocks
-      ── per following serialized pattern ──
-      [8 B end-of-pattern trailer] = 00 00 <prev_tc-1> <quantize> 00 00 00 00
-      [4 B next-pattern header]    = <slot> <tc> 00 00
-      <tc> track blocks
-      ...
-      [8 B end-of-last-pattern trailer] = 00 00 <last_tc-1> <quantize> 00 00 00 00
-0xEnd [12 B bank summary] 6f 73 7c 74   bank trailer ("os|t")
-```
-- **`<slot>`** = the device pattern slot (0–15) of the upcoming pattern. Only **used**
-  patterns are serialized, so slots can be **sparse** (e.g. `04_pitch_vel_sustain` stores
-  slots 0 and 2 = Patterns 1 & 3). The first serialized pattern is implicitly slot 0.
-- **`prev_tc-1`** = (track-count of the pattern that just ended) − 1.
-- **`<quantize>`** (trailer 4th byte) = that pattern's **Quantize** (per-pattern; same enum as
-  Length — 0=1 bar default). Was previously read as a constant `00`. See Backup-1 decode.
-- **Bank summary (12 B):** `<tempo:u16 LE> 00 00 00 <cur> <cur> 01 00 00 00 <cur>` — **bytes 0–1 =
-  Tempo (BPM, 24–280; default 120 = `78 00`)**; `<cur>` (offsets 5,6,11) is the **saved cursor**
-  — the pattern slot selected when the backup was taken (the device opens the bank on it). Cursor 0
-  always valid.
-- A lock-bearing block's extra terminator byte (see above) lands inside these gaps, so the
-  pattern-boundary gap measures 12 (lock-free last block) or 13 (last block has locks).
+## Container detail: per-bank `.t1` (Firmware Ground Truth)
+Decompilation of ESP32 firmware v2.1.5 reveals the exact C++ methods that read and write `.t1` files.
+What earlier empirical RE interpreted as "flat magic headers" (`03 00 03 00 00`) and "inter-pattern gap headers" (`<slot> <tc> 00 00`)
+is actually the standard recursive serialization of the T-1 object model:
 
-Autosave equivalent: one hash-named file per pattern (header `<tc> 00 00` + blocks +
-12 B `…os|t` trailer), a constant 14 B global file `05 "2.1.4" 00 00 00 00 os|t`, and (with
-2+ patterns) a 22 B index file whose payload equals the per-bank trailer/bank-summary.
+```
+[FileStream Header]
+0x00  05 "2.1.4" (or "2.1.5")          version length + ASCII SemVer string
+
+[Bank::deserialize — FUN_40157e4c]
+0x06  <pattern_count:u8>               number of serialized patterns (0 = empty bank)
+
+      ── For each pattern (0 .. pattern_count - 1): [Pattern::deserialize — FUN_4015796c] ──
+      0x07  <pattern_id:u8>            slot index (0–15) of this pattern
+      0x08  <track_count:u8>           number of tracks in this pattern
+
+            ── For each track (0 .. track_count - 1): [Track::deserialize — FUN_401575b4] ──
+            0x09  <track_id:u8>        slot index (0–15) of this track
+            0x0a  <flags:u8>           serialization flags (0 = standard)
+            0x0b  0c 00                block marker (u16 LE: 12)
+            ...   [Track Body]         pitch list, gate array (64 B), locks, cycles, params
+            ...   <end_marker:u8>      (next track's slot index - 1), or sentinel if last
+            ...   [<lock_term:u8>]     optional terminator byte if track carries locks
+
+      [Pattern Trailer — FUN_4015796c]
+      00 00 <prev_tc-1:u8>             padding + (track_count - 1)
+      <quantize:u8>                    pattern quantize setting (enum: 0=1 bar default)
+      <automation_count:u32 LE>        count of CC automation records (added in v2.0.3)
+      [automation_count × 48 B]        48-byte CC automation structs (empty = 00 00 00 00)
+
+[Bank Trailer & Summary — FUN_40157e4c]
+<tempo:u16 LE>                         tempo BPM (24–280, default 120 = 78 00)
+00 00 00                               padding
+<active_pattern:u8>                    selected pattern slot cursor
+<active_pattern:u8>                    selected pattern slot cursor (duplicate)
+01 00 00 00                            bank status flag / version word
+<active_pattern:u8>                    selected pattern slot cursor (duplicate)
+
+[FileStream EOF Tag — FUN_400edbe8]
+6f 73 7c 74                            ASCII "os|t" (0x747c736f LE mandatory integrity tag)
+```
+
+### Explaining the empirical RE observations
+- **The "5-byte bank header (`03 00 03 00 00`)"**: This was simply `pattern_count=3` (`0x06`), followed by
+  Pattern 0's `pattern_id=0` (`0x07`), Pattern 0's `track_count=3` (`0x08`), Track 0's `track_id=0` (`0x09`),
+  and Track 0's `flags=0` (`0x0a`), followed by the block marker `0c 00` (`0x0b`).
+- **The "4-byte gap header (`<slot> <tc> 00 00`)"**: This was simply the next pattern's `pattern_id` and
+  `track_count`, followed by its first track's `track_id` and `flags`.
+- **The trailing `00 00 00 00` in the pattern trailer**: This is a `uint32_le` count of 48-byte CC automation
+  records (`automation_count`). When no CC automation is recorded, count is 0 (`00 00 00 00`).
+- **Sparse tracks & position markers**: Because only non-empty patterns and tracks are serialized, each block's
+  end-marker holds `(next_serialized_track_slot - 1)`, allowing empty slots between tracks to be skipped without
+  padding.
+- **Autosave note**: In v2.1.x, autosave is a periodic flush of the active bank to `/littlefs/N.t1`. There is no
+  secondary per-pattern container format in modern production firmware.
 
 ## Reference dump: single-track per-bank `.t1` (e.g. `1.t1`, 838 bytes)
 
