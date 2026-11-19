@@ -14,10 +14,13 @@ Legend: offsets are 0-based hex. `u8` = one byte, `u16` = 16-bit unsigned intege
 ## Firmware storage & transport architecture
 1. **Flash Storage (`/littlefs/`)**: Banks are not generated on the fly during backup. Active banks
    continuously live in onboard SPI flash formatted with LittleFS as `/littlefs/0.t1` through `/littlefs/7.t1`.
-2. **Autosave in v2.1.x**: The hypothesized "Autosave snapshot" (per-pattern files in `autosave/`) was an
-   artifact of older pre-v2 toolchains or external managers. In production firmware v2.1.x, `"autosave"`
-   is simply a boolean setting in `Settings.json`. When active, the sequencer periodically flushes the
-   current bank in-memory state directly to `/littlefs/N.t1`. All bank containers use the standard `.t1` format.
+2. **Autosave in v2.1.x**: With `"autosave"` enabled in `Settings.json`, the device also writes a
+   `t1-project/autosave/` folder next to `Settings.json`: one `.t1`-format file per export containing
+   ONLY the currently selected pattern (verified 2026-11-18: its 16 track blocks match pattern 1 of a
+   Config-app backup of the same state, byte for byte, and the hash-style file name stays the same as
+   the pattern's contents change). Alongside it: `autosave/855905950` (21 B) holds the project tempo as
+   a u16 LE at offset 6, and `autosave/4098595179` (14 B) is `05 "2.1.5"` + four zero bytes + `os|t`
+   (an empty list, purpose unknown). The autosave pattern file carries no pattern slot and no tempo.
 3. **Transport Protocol**: During a "Backup" operation, the device transmits raw bank files over MIDI SysEx
    using standard 7-to-8 bit MSB packing. The Torso Config app receives the SysEx dump, unpacks the 8-bit stream,
    and writes `0.t1`..`7.t1`, `Settings.json`, and `Wifi.json` into the resulting `.zip`.
@@ -103,6 +106,9 @@ between them.)
 **Tempo (global, per-bank) — CORRECTION to earlier RE:** the byte long documented as a constant
 `0x78` at the start of the 12-B **bank summary** is actually **Tempo (u16 LE, BPM)**. Default 120 =
 `78 00`; backup-1 banks read `18 00`=24 and `16 01`=278 (set to 24 / 280 — device landed on 278).
+   **2.1.5 note (2026-11-18):** the fw 2.1.5 summary is **11 B** (tempo + 9 zero bytes), not 12 — every
+   sample here is 2.1.4, and a fixed `-16` offset misreads 2.1.5 tempo as 31498. `parse_bank` now picks
+   the summary length from the firmware version.
 So the summary is `<tempo:u16 LE> 00 00 00 <cur> <cur> 01 00 00 00 <cur>`. Range 24–280, stored as
 BPM directly (24→24 exact). Tempo lives ONLY in the bank summary, not in any track block.
 

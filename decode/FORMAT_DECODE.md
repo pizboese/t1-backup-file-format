@@ -14,8 +14,8 @@ Offsets are relative to the `steps` field unless noted. `(B1)` = decoded in back
 | Feature | Range | Status / location |
 |---|---|---|
 | Steps | 1–64, def 16 | ✅ `steps+0x00`; 64-B gate @ `run+0x0c` |
-| Pulses (count) | 1–steps | 🟡 `steps+0x15` u8 (count 1→16) — located B21 |
-| Rotate | directional | 🟡 `steps+0x13a` u8 — located B21 (sign unconfirmed) |
+| Pulses (count) | 1–steps | ✅ `steps+0x15` u8 — equals the generated-bit count of the stored gate on every sample track (2026-11-18) |
+| Rotate | directional | ✅ `steps+0x13a` u8 — rotates the generated pattern RIGHT (confirmed via the generator formula, 2026-11-18) |
 | Cycles | 1–16, def 4 | ✅ `steps+0x14d`; per-cycle engine decoded |
 | Division | note values; Free | ✅ `steps+0x2a` u16 + free-flag `steps+0x299` (B1) |
 | Repeats | 0–48 (+∞) | 🟡 `steps+0xfa` u8 (stored repeats+1) — located B21 |
