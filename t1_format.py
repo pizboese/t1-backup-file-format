@@ -95,14 +95,15 @@ def _pitch_count_and_start(data, run):
     return 1, run - 0x0c
 
 
-def _parse_header(data, run):
-    """Parse the block header (back from `run`): locate the `0c 00 <pc> 00 00 00` marker,
-    read the base pitch list, then any per-cycle TRACK-PITCH overrides that follow it.
-    Returns (pitch_count, block_start, base_pitches, pitch_overrides) where pitch_overrides
-    is a list of (cycle_idx, [pitches]). See FORMAT.md "Per-cycle TRACK-PITCH overrides"."""
-    pc, bstart = _pitch_count_and_start(data, run)
-    base = list(data[bstart + 6:bstart + 6 + pc])
-    p = bstart + 6 + pc
+def _parse_header(data, run, block_start=None):
+    """Parse the block header: read the base pitch list, then any per-cycle TRACK-PITCH overrides
+    that follow it. Returns (pitch_count, block_start, base_pitches, pitch_overrides) where
+    pitch_overrides is a list of (cycle_idx, [pitches]). See FORMAT.md "Per-cycle TRACK-PITCH overrides"."""
+    if block_start is None:
+        pc_fallback, block_start = _pitch_count_and_start(data, run)
+    pc = data[block_start + 2]
+    base = list(data[block_start + 6:block_start + 6 + pc])
+    p = block_start + 6 + pc
     overrides = []
     num_ov = data[p]
     # validate: the override list is immediately followed by the `0c 00 00 00`->run separator
@@ -116,7 +117,91 @@ def _parse_header(data, run):
         q += 5 + cnt
     if not ok:
         overrides = []
-    return pc, bstart, base, overrides
+    return pc, block_start, base, overrides
+
+
+def _skip_lock_lists(data, p):
+    """Skip [groove list][pitch list] at p (the base track's, or a cycle record's). Returns end offset."""
+    for _ in range(2):
+        n = data[p]; p += 1
+        if _ == 0:                               # groove: [entries][step] then entries x [param][val][00 00 00]
+            for _ in range(n):
+                p += 2 + data[p] * 5
+        else:                                    # pitch: [step][count u32][pitches]
+            for _ in range(n):
+                p += 5 + int.from_bytes(data[p + 1:p + 5], "little")
+    return p
+
+
+def walk_block(data, start):
+    """Walk one track block forward through its grammar from `start` (its leading u16) and return
+    (block_start, run, block_end), or raise ValueError.
+
+    A block is a sequential stream — [u16 (usually 12)] [u32 note count][notes] [pitch overrides]
+    [u32 scale length][scale degrees] [64-B gate] [lock lists] [cycle records] [param overrides]
+    [16-B pad] [steps region] [terminator] — with no length or offset fields, so everything is
+    walked field by field. Unlike the `0c 00`-marker + `00 01..0b`-run landmark scan, this handles
+    blocks with custom scales (the "run" is the scale table, not a constant) or a non-12 leading
+    u16 (both occur: samples 22/23). The walk is validated against the fixed Zone-B terminator, so
+    a misparse fails loudly instead of yielding a corrupt block."""
+    if start + 10 > len(data):
+        raise ValueError("truncated")
+    note_count = int.from_bytes(data[start + 2:start + 6], "little")
+    if not 1 <= note_count <= 16:
+        raise ValueError(f"bad note count {note_count} at {start:#x}")
+    try:
+        p = start + 6 + note_count
+        num_ov = data[p]; p += 1
+        if num_ov > 16:
+            raise ValueError("bad pitch-override count")
+        for _ in range(num_ov):                  # [cycle][count u32][pitches]
+            p += 5 + int.from_bytes(data[p + 1:p + 5], "little")
+        scale_len = int.from_bytes(data[p:p + 4], "little")
+        if not 1 <= scale_len <= 12:
+            raise ValueError(f"bad scale length {scale_len} at {p:#x}")
+        gate = p + 4 + scale_len
+        p = _skip_lock_lists(data, gate + GATE_LEN)
+        num_rec = data[p]; p += 1
+        if num_rec > 16:
+            raise ValueError("bad cycle-record count")
+        for _ in range(num_rec):                 # [cycle][64-B gate][lock lists]
+            p = _skip_lock_lists(data, p + 1 + GATE_LEN)
+        num_par = data[p]; p += 1
+        if num_par > 64:
+            raise ValueError("bad param-override count")
+        for _ in range(num_par):                 # [count][cycle] then count x [param][u16][00 00]
+            p += 2 + data[p] * 5
+        steps = p + 16                           # 16-B pad (PAD_AFTER_LOCKS' 18 = these 2 count bytes + 16)
+    except IndexError:
+        raise ValueError("truncated block") from None
+    if steps + TAIL_AFTER_STEPS > len(data) or data[steps + 0x292:steps + 0x296] != b"\x00\x00\x00\x53":
+        raise ValueError(f"Zone-B terminator not at steps={steps:#x} as the grammar predicts")
+    summary = data[steps + S_LOCK_FLAG] != 0
+    form_x = summary and data[steps + TAIL_AFTER_STEPS - 1] == 0
+    end = steps + TAIL_AFTER_STEPS + (1 if summary else 0) + (1 if form_x else 0)
+    return start, gate - OFF_GATE, end
+
+
+def find_blocks(data, start, stop):
+    """Walk consecutive blocks from `start` until `stop`. Returns [(block_start, run, block_end)];
+    stops at the first block that doesn't parse (callers fall back to the landmark scan)."""
+    out = []
+    while start < stop:
+        try:
+            bs, run, end = walk_block(data, start)
+        except ValueError:
+            break
+        out.append((bs, run, end))
+        start = end
+    return out
+
+
+def _walkable(data, o):
+    try:
+        walk_block(data, o)
+        return True
+    except ValueError:
+        return False
 
 
 def _last_zoneB_term(data, run, hi):
@@ -153,8 +238,8 @@ def _parse_locks(data, run):
     return groove, pitch, steps_offset
 
 
-def parse_track(data, run, block_hi=None):
-    pc, bstart, pitches, pitch_overrides = _parse_header(data, run)
+def parse_track(data, run, block_hi=None, block_start=None):
+    pc, bstart, pitches, pitch_overrides = _parse_header(data, run, block_start)
     gate = list(data[run + OFF_GATE:run + OFF_GATE + GATE_LEN])    # full 64-step gate
     groove_locks, pitch_locks, so = _parse_locks(data, run)
     # Per-cycle step-sequence records (FORMAT.md) live between the base lock lists and `steps`,
@@ -247,12 +332,44 @@ def parse_bank(path):
     vstr = data[1:1+vlen].decode("ascii", errors="replace")
     if not (vstr.startswith("2.1.") or vstr.startswith("2.")):
         raise ValueError(f"{path}: unsupported firmware version {vstr!r} (expected 2.1.x)")
-    runs = find_runs(data)
+    # Block discovery, grammar-first: walk the sequential block stream (handles custom scales and
+    # non-12 leading u16s, which the `00 01..0b` landmark scan misses — e.g. samples 22/23). Falls
+    # back to the landmark scan when the walk can't cover the bank. An empty bank has no blocks.
+    bstarts, runs, his = [], [], []
+    if data[6] == 0:
+        pass                                    # empty bank: no blocks to walk
+    else:
+        try:
+            p = 0x0b                            # [npat][pslot][tc][tslot][flags] -> first block
+            summary_start = len(data) - 4 - (12 if vstr <= "2.1.4" else 11)
+            for i in range(data[6]):
+                if i == 0:
+                    slot, tc, bs = data[7], data[8], 0x0b   # pattern 0's header is the bank header itself
+                else:                   # later patterns: [slot][tc] header, found past the variable trailer
+                    slot, tc, bs = data[p], data[p + 1], p + 4
+                if not (slot < 16 and 1 <= tc <= 16):
+                    raise ValueError(f"bad pattern header at {p if i else 7:#x}")
+                for _ in range(tc):             # tracks within a pattern abut exactly
+                    bs, run, end = walk_block(data, bs)
+                    bstarts.append(bs); runs.append(run); his.append(end)
+                    bs = end
+                if i < data[6] - 1:             # skip the variable-length pattern trailer
+                    p = next((q for q in range(bs, summary_start)
+                              if data[q] < 16 and 1 <= data[q + 1] <= 16 and data[q + 2] < 16
+                              and _walkable(data, q + 4)), None)
+                    if p is None:
+                        raise ValueError("next pattern header not found")
+            if bs > summary_start:
+                raise ValueError("last pattern runs past the bank summary")  # the 8-B end-trailer may follow
+        except ValueError:
+            bstarts = None
+            runs = find_runs(data)
+            starts = [_pitch_count_and_start(data, r)[1] for r in runs]
+            his = starts[1:] + [len(data)]
     # pass each block's upper bound (next block start) so cycle-bearing blocks can anchor
     # `steps` off the Zone-B terminator instead of the (shifted) forward lock walk.
-    starts = [_pitch_count_and_start(data, r)[1] for r in runs]
-    his = starts[1:] + [len(data)]
-    tracks = [parse_track(data, r, block_hi=h) for r, h in zip(runs, his)]
+    tracks = [parse_track(data, r, block_hi=h, block_start=bs)
+              for r, h, bs in zip(runs, his, bstarts if bstarts is not None else [None] * len(runs))]
     patterns = group_patterns(tracks)
     # Assign each track its 1-based position within its pattern. The FIRST serialized track's slot
     # is stored explicitly: byte 0x09 for pattern 0, and the 3rd byte of each later pattern's
@@ -269,13 +386,16 @@ def parse_bank(path):
     # Tempo (global, per-bank) = first 2 bytes of the 12-B bank summary (u16 LE BPM); the summary
     # sits in the last 16 bytes (12 + "os|t"). Per-pattern Quantize = the 4th byte of each pattern's
     # 8-B end trailer (`00 00 <cursor> <quantize> 00 00 00 00`). Both decoded in backup-1.
-    tempo = data[len(data) - 16] | (data[len(data) - 15] << 8)
+    # The summary is 12 B on 2.1.4 but 11 B on 2.1.5 (tempo u16 LE, then 9 zero bytes in the
+    # 2.1.5 banks/autosave seen so far), so locate it from the version, not a fixed -16.
+    summary = len(data) - 4 - (12 if vstr <= "2.1.4" else 11)
+    tempo = data[summary] | (data[summary + 1] << 8)
     quantize = []
     for pi, pat in enumerate(patterns):
         if pi < len(patterns) - 1:
             q_off = patterns[pi + 1][0]["block_start"] - 12 + 3   # trailer 4th byte
         else:
-            q_off = len(data) - 16 - 8 + 3                        # final trailer before summary
+            q_off = summary - 8 + 3                               # final trailer before summary
         quantize.append(data[q_off])
     return {"path": path, "size": len(data), "version": vstr, "tempo": tempo,
             "tracks": tracks, "patterns": patterns, "quantize": quantize}
